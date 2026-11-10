@@ -21,17 +21,23 @@ return function(G)
     return co
   end
 
-  local function create(f)
-    R.checkfunction(f, 1, "create")
+  -- luaB_cocreate; fname names the function for argument errors
+  local function newco(f, fname)
+    R.checkfunction(f, 1, fname)
     local co = cocreate(function(...)
       local r = pack(pcall(R.call, f, ...))
       if r[1] then return unpack(r, 2, r.n) end
+      local e = R.popto(0, r[2])
       -- closed by coroutine.close (from inside): the coroutine ends normally
-      if r[2] == R.CLOSING then return end
-      error(r[2], 0)
+      if e == R.CLOSING then return end
+      error(e, 0)
     end)
     stacks[co] = { n = 0 }
     return co
+  end
+
+  local function create(f)
+    return newco(f, "create")
   end
 
   -- Resumes co on its own frame stack. Returns the host results.
@@ -82,12 +88,13 @@ return function(G)
   end
 
   local function wrap(f)
-    R.checkfunction(f, 1, "wrap")
-    local co = create(f)
+    local co = newco(f, "wrap")
     return function(...)
       local r = resume_raw(co, ...)
       if not r[1] then
+        -- auxwrap: a string error gets the position of the wrap function's caller
         local err = r[2]
+        if type(err) == "string" then err = R.where(1) .. err end
         R.throw(err)
       end
       return unpack(r, 2, r.n)

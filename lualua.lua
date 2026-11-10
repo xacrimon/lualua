@@ -12,12 +12,19 @@ local R = require("runtime")
 local I = require("interp")
 local L = require("loader")
 
+-- msghandler in lua.c: a non-string error object is shown through
+-- __tostring, or by its type
 local function errmsg(e)
   if type(e) == "string" then return e end
-  return R.tostring(e)
+  if R.metamethod(e, "__tostring") ~= nil then
+    local ok, s = pcall(R.tostring, e)
+    if ok then return s end
+  end
+  return "(error object is a " .. R.type(e) .. " value)"
 end
 
 local function die(msg)
+  io.stdout:flush()   -- the output printed so far comes first
   io.stderr:write("lua: ", msg, "\n")
   os.exit(1)
 end
@@ -26,7 +33,7 @@ local function runchunk(G, src, chunkname, args)
   local f, err = L.load(src, chunkname, G)
   if not f then die(err) end
   local ok, e = pcall(R.call, f, table.unpack(args, 1, args.n))
-  if not ok then die(errmsg(e)) end
+  if not ok then die(errmsg(R.popto(0, e))) end
 end
 
 local function main(argv)
@@ -79,8 +86,13 @@ local function main(argv)
     if not fh then die("cannot open " .. script) end
     local src = fh:read("a")
     fh:close()
+    -- as luaL_loadfile: skip a byte order mark and a first '#' line (keeping
+    -- its newline, so line numbers stay)
     if src:sub(1, 3) == "\239\187\191" then src = src:sub(4) end
-    if src:sub(1, 1) == "#" then src = "--" .. src end
+    if src:sub(1, 1) == "#" then
+      local e = src:find("\n", 1, true)
+      src = e and src:sub(e) or ""
+    end
     runchunk(G, src, "@" .. script, scriptargs)
   elseif #exec == 0 then
     interactive = true

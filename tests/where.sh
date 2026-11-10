@@ -3,7 +3,7 @@
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TESTES=${TESTES:-$ROOT/tests/adapted/testes}
 for f in "$@"; do
-  out=$(cd "$TESTES" && LUALUA_DEBUG=1 timeout 60 lua "$ROOT/lualua.lua" -e "_port=true;_soft=true;_nomsg=true" "$f" 2>&1)
+  out=$(cd "$TESTES" && LUALUA_DEBUG=1 perl -e 'alarm shift; exec @ARGV' 60 lua "$ROOT/lualua.lua" -e "_port=true;_soft=true;_nomsg=true" "$f" 2>&1)
   rc=$?
   loc=$(echo "$out" | grep -o "assertion failed at [^ ]*" | head -1)
   err=$(echo "$out" | grep "^lua:" | head -1 | cut -c1-200)

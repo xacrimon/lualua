@@ -95,6 +95,7 @@ local function newfs(parent, isvararg)
     actvars = {},    -- active local VarInfos (stack)
     upvals = {},     -- upvalue descriptions
     nslots = 0,
+    nvars = 0,       -- active local variables (global declaration entries do not count)
     isvararg = isvararg,
     block = nil,     -- innermost open block
   }
@@ -139,7 +140,11 @@ local function closeblock(b)
       errorat("no visible label '" .. g.name .. "' for <goto> at line " .. g.line, g.line)
     end
   end
-  for i = #fs.actvars, b.nactive + 1, -1 do fs.actvars[i] = nil end
+  local av = fs.actvars
+  for i = #av, b.nactive + 1, -1 do
+    if not av[i].pseudo then fs.nvars = fs.nvars - 1 end
+    av[i] = nil
+  end
   for i = #gdecls, b.ngdecl + 1, -1 do gdecls[i] = nil end
   fs.block = b.parent
 end
@@ -470,14 +475,11 @@ end
 local MAXVARS = 200   -- active local variables per function (as in lparser.c)
 
 local function activate(vi)
-  local nvars = 0   -- active variables (global declaration entries do not count)
-  for _, v in ipairs(fs.actvars) do
-    if not v.pseudo then nvars = nvars + 1 end
-  end
-  if nvars >= MAXVARS then
+  if fs.nvars >= MAXVARS then
     local where = fs.line and ("function at line " .. fs.line) or "main function"
     errorat("too many local variables (limit is " .. MAXVARS .. ") in " .. where, ls.tl)
   end
+  fs.nvars = fs.nvars + 1
   fs.actvars[#fs.actvars + 1] = vi
 end
 
@@ -595,7 +597,8 @@ local function exprstat(line)
     checknext("=")
     local exprs = explist()
     checkassignable(targets, line)
-    return { k = "assign", targets = targets, exprs = exprs, line = line }
+    -- the stores are emitted after the values: on the line of the last token
+    return { k = "assign", targets = targets, exprs = exprs, line = line, sline = ls.lastline }
   end
   -- must be a function call
   if e.k ~= "call" and e.k ~= "method" then
@@ -792,6 +795,9 @@ local function statement()
   elseif t == "return" then
     return retstat(line)
   elseif t == "break" then
+    local bl = fs.block
+    while bl and not bl.isloop do bl = bl.parent end
+    if not bl then syntaxerror("break outside loop") end
     ls:advance()
     return { k = "break", line = line }
   elseif t == "goto" then

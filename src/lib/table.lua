@@ -1,12 +1,32 @@
-local pack, unpack = table.pack, table.unpack
 -- table.lua: table library, following ltablib.c (Lua 5.5).
--- Element access goes through R.index / R.setindex / R.len so that
--- __index, __newindex and __len are honoured.
+-- Element access follows lua_geti / lua_seti, so __index, __newindex and
+-- __len are honoured.
 local R = require("runtime")
 
--- element access may call metamethods, which are not yieldable from a library function
-local function geti(t, k) return R.noyield(R.index, t, k) end
-local function seti(t, k, v) return R.noyield(R.setindex, t, k, v) end
+local unpack, concat = table.unpack, table.concat
+local isTable = R.isTable
+
+-- lua_geti: a plain table is read directly; otherwise the metamethods run,
+-- which are not yieldable from a library function
+local function geti(t, k)
+  if isTable(t) then
+    local v = t.hash[k]
+    if v ~= nil or t.mt == nil then return v end
+  end
+  return R.noyield(R.index, t, k)
+end
+
+-- lua_seti (k is an integer, so it is a valid key)
+local function seti(t, k, v)
+  if isTable(t) then
+    local h = t.hash
+    if t.mt == nil or h[k] ~= nil then
+      h[k] = v
+      return
+    end
+  end
+  R.noyield(R.setindex, t, k, v)
+end
 local ult = math.ult
 local maxint = math.maxinteger
 local INT_MAX = 2147483647
@@ -111,17 +131,17 @@ local function tconcat(t, sep, i, j)
   sep = R.optstring(sep, 2, "concat", "")
   i = R.optinteger(i, 3, "concat", 1)
   last = R.optinteger(j, 4, "concat", last)
-  local buf = {}
+  local buf, nb = {}, 0
   for k = i, last do
     local v = geti(t, k)
     local tv = type(v)
     if tv ~= "string" and tv ~= "number" then
       R.rterror("invalid value (" .. R.type(v) .. ") at index " .. k .. " in table for 'concat'")
     end
-    buf[#buf + 1] = tostring(v)
-    if k < last then buf[#buf + 1] = sep end
+    nb = nb + 1; buf[nb] = tostring(v)
+    if k < last then nb = nb + 1; buf[nb] = sep end
   end
-  return table.concat(buf)
+  return concat(buf, "", 1, nb)
 end
 
 local function tpack(...)
@@ -142,17 +162,19 @@ local function tunpack(t, i, j)
   if d < 0 or d >= INT_MAX or d + 1 >= 1000000 then
     R.rterror("too many results to unpack")
   end
+  if isTable(t) and t.mt == nil then return unpack(t.hash, i, e) end
   local vals = {}
   for k = 0, d do vals[k + 1] = geti(t, i + k) end
-  return table.unpack(vals, 1, d + 1)
+  return unpack(vals, 1, d + 1)
 end
 
 ---------------------------------------------------------------------------
 -- Quicksort (Sedgewick, as in ltablib.c). 'less' is the order predicate.
 ---------------------------------------------------------------------------
 
+-- l_randomizePivot
 local function makeseed()
-  return (os.time() * 1000003 + math.floor(os.clock() * 1e6)) & 0xFFFFFFFF
+  return R.makeseed() & 0xFFFFFFFF
 end
 
 local function choosePivot(lo, up, rnd)
@@ -256,16 +278,17 @@ return function(G)
     move = tmove,
     pack = tpack,
     remove = tremove,
-    sort = function(...)
-      -- the comparator and metamethods run from a C boundary: not yieldable
+    sort = function(t, comp)
+      -- the comparator and metamethods run from a C boundary: not yieldable,
+      -- and called from a native (no Lua call site)
       local st = R.stack
       local saved, savednat = st.nny or 0, st.nat
       st.nny = saved + 1
-      st.nat = st.n   -- the comparator is called from a native (no Lua call site)
-      local r = pack(tsort(...))
+      st.nat = st.n
+      local ok, err = pcall(tsort, t, comp)
       st.nny = saved
       st.nat = savednat
-      return unpack(r, 1, r.n)
+      if not ok then error(err, 0) end
     end,
     unpack = tunpack,
   })

@@ -1,13 +1,16 @@
 # lualua — design notes
 
 Goal: a mostly working Lua 5.5.1 interpreter written in Lua 5.5, run by the
-host `lua` (5.5). Reference C implementation and official test suite:
-`/home/acrimon/work/lua` (`testes/`, `manual/manual.of`, `src`-level files).
+host `lua` (5.5). Reference C implementation and official test suite: a
+checkout of the reference `lua` repository (`testes/`, `manual/manual.of`,
+`src`-level files), by default `../lua` next to the tcvm checkout.
 
 ## Boundary: what the host provides vs. what we implement
 
 Host primitives we rely on (they have the right semantics already):
-- arithmetic / comparison / concatenation on numbers and strings
+- arithmetic / comparison / concatenation on numbers and strings (strings are
+  converted for arithmetic by the string metamethods, as in `lstrlib.c`; the
+  core arithmetic accepts only numbers)
 - `tonumber(string)` (same conversion rules as `lua_stringtonumber`)
 - `math.tointeger`, `math.type`, math functions (`math.sin`, `math.fmod`, ...)
 - `tostring(number)` (same `%.14g` formatting as Lua)
@@ -87,9 +90,17 @@ e.g. `bad argument #1 to 'rep' (number expected, got nil)`.
 ## Frames and positions
 
 `R.stack` is the running coroutine's frame stack; compiled Lua functions push
-`{src=..., line=...}` frames. Natives push nothing. `R.where(level)` gives the
-position prefix. `error(msg, level)` must use `R.where(level)` with level 1
-meaning "the Lua function that called error".
+their activation record as the frame (layout in the `compiler.lua` header).
+Natives push nothing. `R.where(level)` gives the position prefix.
+`error(msg, level)` must use `R.where(level)` with level 1 meaning "the Lua
+function that called error".
+
+A call allocates only its frame (plus a vararg table and cells for captured
+locals when needed): call sites with up to 3 arguments pass them directly,
+functions with up to 3 parameters bind them as the frame's first items,
+single-value returns and tail calls carry their values without tables, and
+the frame's fields are all created by its constructor. Static information
+(chunk name, lines) lives in the compiled proto, reached as `A.up.c`.
 
 ## Module layout
 
@@ -103,10 +114,11 @@ src/compiler.lua    AST -> Lua closures (the "interpreter" proper); activation
                     records A are also the stack frames
 src/loader.lua      source text -> Lua function (chunkid, load)
 src/interp.lua      builds the global environment, loads libraries
-src/lib/base.lua    print, pairs, pcall, load, select, require, collectgarbage, ...
+src/lib/base.lua    print, pairs, pcall, load, select, collectgarbage, ... and the
+                    package library (require, package.searchers, searchpath)
 src/lib/string.lua  string library incl. Lua patterns, format, pack/unpack
 src/lib/table.lua   table library
-src/lib/math.lua    math library (incl. frexp/ldexp and compat functions)
+src/lib/math.lua    math library (incl. frexp/ldexp; no LUA_COMPAT_MATHLIB functions)
 src/lib/utf8.lua    utf8 library
 src/lib/os.lua      os library
 src/lib/io.lua      io library (files are userdata)
@@ -114,33 +126,37 @@ src/lib/coroutine.lua coroutine library (host coroutines, per-coroutine frame st
 src/lib/debug.lua   partial debug library (getinfo names/lines, upvalue access)
 tests/run_testes.sh run files of the official suite (default: all but heavy.lua)
 tests/where.sh      report the first failing assertion location per file
+tests/regress.lua   regression checks for fixed bugs (passes under lua and lualua)
 ```
 
 ## Debugging aids
 
 - `LUALUA_DEBUG=1` makes a failing `assert` print its position on stderr.
-- Each Lua frame records `src`, `line` and the call-site description `cdesc`
-  (used by `debug.getinfo(level, "n")`).
+- Each Lua frame records `line` and the call-site description `cdesc`
+  (used by `debug.getinfo(level, "n")` and to name functions in argument errors,
+  as `luaL_argerror` does).
 
 ## Status against the official suite
 
 Test workflow:
 - `tests/make_adapted.sh` regenerates `tests/adapted/testes` from the official
-  suite (`/home/acrimon/work/lua/testes`) and applies the exclusion stubs; the
-  log is `tests/adapted/STUBLOG.txt`. The official directory is never modified.
+  suite (`LUA_TESTES`, default `../lua/testes` next to the tcvm checkout) and
+  applies the exclusion stubs; the log is `tests/adapted/STUBLOG.txt`. The
+  official directory is never modified.
 - `tests/run_testes.sh` runs the adapted suite (default); `tests/where.sh <file>`
   reports the first failing assertion.
 - Excluded (stubbed, tagged `STUB[category]`): `debug` (debug library behaviour,
   section by section; `db.lua` keeps its sections of plain Lua), `dump`
   (`string.dump` and binary chunks), `pointer` (address identity, string
-  interning), `memory` (`collectgarbage("count")` measurements).
+  interning), `memory` (`collectgarbage("count")` measurements), `platform`
+  (host features that are missing, such as `/dev/full` on macOS).
 - The adapted copy keeps the official line numbers: the stub prelude shares the
   first line of each file.
 
 Debug library, as implemented (`src/lib/debug.lua`) and as stubbed:
 - `getinfo`: `what`, `source`, `short_src`, `currentline`, `linedefined`,
   `lastlinedefined`, `func`, `name`/`namewhat` (from call descriptions) are
-  supported. Missing: `activelines` (`L`), `nparams`, `nups`, `isvararg`,
+  supported, for levels and for functions. Missing: `activelines` (`L`), `nparams`, `nups`, `isvararg`,
   `istailcall`, `ftransfer`/`ntransfer`, `nparams` for C functions, and
   name/namewhat `metamethod` and `for iterator` for frames not on the stack.
 - `sethook`: clearing hooks (`sethook()`, a nil hook) is a no-op, since no hook
@@ -174,7 +190,17 @@ Known gaps that remain (not excluded):
   change the collector. `collectgarbage("count")` is the host's memory figure.
 - Lua call depth is capped at 50000 frames (`MAXDEPTH` in `compiler.lua`); the
   reference overflows by stack size, so the depth at which "stack overflow"
-  appears differs.
+  appears differs. Each Lua frame costs several host frames, so the host's own
+  stack often runs out first (at about 18000-48000 frames on PUC Lua, depending
+  on how deeply the call sits in nested statements; at about 650-1700 frames on
+  tcvm, whose own Lua stack is much smaller). Programs that recurse deeply
+  therefore behave differently across hosts; this is accepted. Protected calls turn that
+  host error into a Lua "stack overflow" at the innermost frame (`R.popto`).
+- `load` with a reader function reads all pieces before compiling, so a reader
+  is called until it returns nil or "" even when the chunk has a syntax error
+  in an earlier piece (the reference reads on demand).
+- `print` does not flush (the reference flushes after each call); the
+  command-line interpreter flushes standard output before reporting an error.
 - In `db.lua`, the line-trace helper `test` (lines 19-29) no longer checks
   anything, because its `assert(#l == 0)` is stubbed. The `test([[...]], {...})`
   calls that remain in the file therefore verify nothing (the large-gap loop

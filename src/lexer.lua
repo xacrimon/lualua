@@ -171,10 +171,7 @@ end
 -- returns its level (number of '='); otherwise nil.
 function Lexer:longlevel(pos)
   local src = self.src
-  if sbyte(src, pos) ~= 91 then
-    -- comments: pos is just after "--"; the bracket must be at pos itself
-    if sbyte(src, pos) ~= 91 then return nil end
-  end
+  if sbyte(src, pos) ~= 91 then return nil end
   local p = pos + 1
   local lvl = 0
   while sbyte(src, p) == 61 do
@@ -352,8 +349,10 @@ local function tokentext(ls)
 end
 M.tokentext = tokentext
 
--- self.line is the lexer's line counter; self.tl is the line of the current token.
+-- self.line is the lexer's line counter; self.tl is the line of the current token
+-- and self.lastline the line of the previous one.
 function Lexer:advance()
+  self.lastline = self.tl   -- line of the token being consumed
   local a = self.ahead
   if a then
     self.ahead = nil

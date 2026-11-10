@@ -4,13 +4,23 @@
 -- perform the raw I/O; format parsing, errors and closing rules live here.
 local R = require("runtime")
 local H = io                                    -- host io library
+local sbyte, schar = string.byte, string.char
+local unpack = table.unpack
 
 local function isFile(v)
   return R.isUserdata(v) and type(v.payload) == "table" and v.payload.lfile == true
 end
 
+-- l_checkmode: [rwa] then an optional '+', then only 'b's
 local function checkmode(m)
-  return m:find("^[rwa]%+?b*$") ~= nil
+  local c = sbyte(m, 1)
+  if c ~= 114 and c ~= 119 and c ~= 97 then return false end
+  local i = 2
+  if sbyte(m, i) == 43 then i = i + 1 end
+  for j = i, #m do
+    if sbyte(m, j) ~= 98 then return false end
+  end
+  return true
 end
 
 local function checkoption(v, n, fname, opts, def)
@@ -78,55 +88,70 @@ local function test_eof(p)
   return ""
 end
 
-local function isdigit(ch, hex)
-  if hex then return ch:find("^%x") ~= nil end
-  return ch:find("^%d") ~= nil
+local L_MAXLENNUM = 200   -- maximum length of a numeral
+
+local function isdigit(c, hex)
+  if c >= 48 and c <= 57 then return true end
+  return hex and ((c >= 97 and c <= 102) or (c >= 65 and c <= 70))
 end
 
--- Mirrors read_number in liolib.c: scan the longest numeral prefix, push
--- back the look-ahead character, and convert the collected text.
-local function read_number(p)
-  local c = getc(p)
-  while c and c:find("^%s") do c = getc(p) end
-  local buf, n, overflow = {}, 0, false
-  local function nextc()
-    if n >= 200 then
-      overflow = true
-      return false
-    end
-    n = n + 1
-    buf[n] = c
-    c = getc(p)
-    return true
-  end
-  local function test2(a, b)
-    if c == a or c == b then return nextc() end
+-- The state of read_number (struct RN in liolib.c): rn.c is the current
+-- character (a byte, or nil at end of file), rn.buff[1 .. rn.n] the numeral.
+local function nextc(rn)
+  if rn.n >= L_MAXLENNUM then   -- buffer overflow
+    rn.overflow = true
     return false
   end
-  local function readdigits(hex)
-    local count = 0
-    while c and isdigit(c, hex) and nextc() do count = count + 1 end
-    return count
-  end
-  local count, hex = 0, false
-  test2("-", "+")
-  if test2("0", "0") then
-    if test2("x", "X") then hex = true else count = 1 end
-  end
-  count = count + readdigits(hex)
-  if test2(".", ".") then count = count + readdigits(hex) end
-  if count > 0 and test2(hex and "p" or "e", hex and "P" or "E") then
-    test2("-", "+")
-    readdigits(false)
-  end
-  if c ~= nil then p.ub = c end
-  if overflow then return nil end
-  return tonumber(table.concat(buf))
+  local n = rn.n + 1
+  rn.buff[n] = rn.c
+  rn.n = n
+  local ch = getc(rn.p)
+  rn.c = ch and sbyte(ch)
+  return true
 end
 
--- g_read: read the formats fmts[1..nargs]; returns the values, or nil
--- plus message and code on a host error.
-local function g_read(p, fname, nargs, fmts)
+-- accept the current char if it is a or b
+local function test2(rn, a, b)
+  local c = rn.c
+  if c == a or c == b then return nextc(rn) end
+  return false
+end
+
+local function readdigits(rn, hex)
+  local count = 0
+  while rn.c and isdigit(rn.c, hex) and nextc(rn) do count = count + 1 end
+  return count
+end
+
+-- read_number: read the longest numeral prefix, push back the look-ahead
+-- character, and convert the collected text.
+local function read_number(p)
+  local ch = getc(p)
+  local c = ch and sbyte(ch)
+  while c and (c == 32 or (c >= 9 and c <= 13)) do   -- skip spaces
+    ch = getc(p)
+    c = ch and sbyte(ch)
+  end
+  local rn = { p = p, c = c, n = 0, buff = {}, overflow = false }
+  local count, hex = 0, false
+  test2(rn, 45, 43)                -- optional sign
+  if test2(rn, 48, 48) then        -- '0'
+    if test2(rn, 120, 88) then hex = true else count = 1 end   -- 'x' 'X'
+  end
+  count = count + readdigits(rn, hex)
+  if test2(rn, 46, 46) then count = count + readdigits(rn, hex) end   -- '.'
+  if count > 0 and (hex and test2(rn, 112, 80) or (not hex and test2(rn, 101, 69))) then
+    test2(rn, 45, 43)              -- exponent sign
+    readdigits(rn, false)
+  end
+  if rn.c ~= nil then p.ub = schar(rn.c) end
+  if rn.overflow then return nil end
+  return tonumber(schar(unpack(rn.buff, 1, rn.n)))
+end
+
+-- g_read: read the formats fmts[1..nargs] (argument numbers start at first);
+-- returns the values, or nil plus message and code on a host error.
+local function g_read(p, fname, nargs, fmts, first)
   p.errmsg = nil
   local res, k = {}, 0
   if nargs == 0 then
@@ -136,18 +161,19 @@ local function g_read(p, fname, nargs, fmts)
     for i = 1, nargs do
       local f = fmts[i]
       local v
+      local arg = first + i - 1
       if type(f) == "number" then
-        local l = R.checkinteger(f, i, fname)
+        local l = R.checkinteger(f, arg, fname)
         if l == 0 then v = test_eof(p) else v = read_chars(p, l) end
       else
-        local s = R.checkstring(f, i, fname)
-        if s:sub(1, 1) == "*" then s = s:sub(2) end
-        local c = s:sub(1, 1)
-        if c == "n" then v = read_number(p)
-        elseif c == "l" then v = read_line(p, true)
-        elseif c == "L" then v = read_line(p, false)
-        elseif c == "a" then v = read_all(p)
-        else R.argerror(i, fname, "invalid format") end
+        local s = R.checkstring(f, arg, fname)
+        local c = sbyte(s, 1)
+        if c == 42 then c = sbyte(s, 2) end   -- skip optional '*'
+        if c == 110 then v = read_number(p)            -- n
+        elseif c == 108 then v = read_line(p, true)    -- l
+        elseif c == 76 then v = read_line(p, false)    -- L
+        elseif c == 97 then v = read_all(p)            -- a
+        else R.argerror(arg, fname, "invalid format") end
       end
       k = i
       res[i] = v
@@ -155,18 +181,22 @@ local function g_read(p, fname, nargs, fmts)
     end
   end
   if p.errmsg then return nil, p.errmsg, p.errcode end
-  return table.unpack(res, 1, k)
+  return unpack(res, 1, k)
 end
 
-local function g_write(ud, p, fname, nargs, args)
+-- g_write: arguments args[1..nargs] are numbered from first. A write error
+-- returns fail, message, code and the number of bytes written.
+local function g_write(ud, p, fname, nargs, args, first)
   if p.ub then   -- discard look-ahead before writing
     p.f:seek("cur", -1)
     p.ub = nil
   end
+  local total = 0
   for i = 1, nargs do
-    local s = R.checkstring(args[i], i, fname)
+    local s = R.checkstring(args[i], first + i - 1, fname)
     local ok, msg, code = p.f:write(s)
-    if not ok then return nil, msg, code end
+    if not ok then return nil, msg, code, total end
+    total = total + #s
   end
   return ud
 end
@@ -228,7 +258,7 @@ return function(G)
     if nf > 250 then R.argerror(252, "lines", "too many arguments") end
     return function()
       if p.closed then R.rterror("file is already closed") end
-      local r = table.pack(g_read(p, "lines", nf, fmts))
+      local r = table.pack(g_read(p, "lines", nf, fmts, 2))
       if r[1] ~= nil then return table.unpack(r, 1, r.n) end
       if r.n > 1 then R.rterror(r[2]) end   -- host error: message in 2nd result
       if toclose then aux_close(p) end
@@ -254,11 +284,11 @@ return function(G)
   R.setfuncs(methods, {
     read = function(self, ...)
       local p = tofile(self, "read")
-      return g_read(p, "read", select("#", ...), { ... })
+      return g_read(p, "read", select("#", ...), { ... }, 2)
     end,
     write = function(self, ...)
       local p = tofile(self, "write")
-      return g_write(self, p, "write", select("#", ...), { ... })
+      return g_write(self, p, "write", select("#", ...), { ... }, 2)
     end,
     lines = function(self, ...)
       local p = tofile(self, "lines")
@@ -268,8 +298,8 @@ return function(G)
     flush = function(self) return aux_flush(tofile(self, "flush")) end,
     seek = function(self, whence, off)
       local p = tofile(self, "seek")
-      local op = checkoption(whence, 1, "seek", { "set", "cur", "end" }, "cur")
-      local o = R.optinteger(off, 2, "seek", 0)
+      local op = checkoption(whence, 2, "seek", { "set", "cur", "end" }, "cur")
+      local o = R.optinteger(off, 3, "seek", 0)
       if p.ub then   -- logical position excludes the pushed-back character
         p.f:seek("cur", -1)
         p.ub = nil
@@ -280,8 +310,8 @@ return function(G)
     end,
     setvbuf = function(self, mode, size)
       local p = tofile(self, "setvbuf")
-      local op = checkoption(mode, 1, "setvbuf", { "no", "full", "line" })
-      return p.f:setvbuf(op, R.optinteger(size, 2, "setvbuf", 1024))
+      local op = checkoption(mode, 2, "setvbuf", { "no", "full", "line" })
+      return p.f:setvbuf(op, R.optinteger(size, 3, "setvbuf", 1024))
     end,
     close = function(self) return aux_close(tofile(self, "close")) end,
   })
@@ -375,13 +405,13 @@ return function(G)
     popen = io_popen,
     read = function(...)
       local _, p = getiofile("input")
-      return g_read(p, "read", select("#", ...), { ... })
+      return g_read(p, "read", select("#", ...), { ... }, 1)
     end,
     tmpfile = io_tmpfile,
     type = io_type,
     write = function(...)
       local ud, p = getiofile("output")
-      return g_write(ud, p, "write", select("#", ...), { ... })
+      return g_write(ud, p, "write", select("#", ...), { ... }, 1)
     end,
   })
   lib.hash.stdin = stdin

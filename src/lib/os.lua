@@ -3,13 +3,19 @@
 -- normalisation for os.time are done here.
 local R = require("runtime")
 local H = os                                    -- host os library
+local sbyte, ssub, sfind = string.byte, string.sub, string.find
 
 -- strftime conversions accepted by os.date (LUA_STRFTIMEOPTIONS, C99)
-local DATE_SINGLE = "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%"
-local DATE_DOUBLE = {}
-for c in ("Ec EC Ex EX Ey EY Od Oe OH OI Om OM OS Ou OU OV Ow OW Oy"):gmatch("%S+") do
-  DATE_DOUBLE[c] = true
+local DATE_SINGLE = {}
+do
+  local single = "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%"
+  for i = 1, #single do DATE_SINGLE[sbyte(single, i)] = true end
 end
+local DATE_DOUBLE = {
+  Ec = true, EC = true, Ex = true, EX = true, Ey = true, EY = true,
+  Od = true, Oe = true, OH = true, OI = true, Om = true, OM = true,
+  OS = true, Ou = true, OU = true, OV = true, Ow = true, OW = true, Oy = true,
+}
 local DATE_FIELDS = { "year", "month", "day", "hour", "min", "sec", "yday", "wday", "isdst" }
 local LOCALE_CATS = { all = true, collate = true, ctype = true, monetary = true, numeric = true, time = true }
 local INT_MAX, INT_MIN = 2147483647, -2147483648
@@ -17,36 +23,42 @@ local INT_MAX, INT_MIN = 2147483647, -2147483648
 local function os_date(fmt, t)
   fmt = R.optstring(fmt, 1, "date", "%c")
   local tt = (t == nil) and H.time() or R.checkinteger(t, 2, "date")
-  local utc = fmt:sub(1, 1) == "!"
-  local pre = utc and "!" or ""
-  local s = utc and fmt:sub(2) or fmt
+  local s, pre = fmt, ""
+  if sbyte(s, 1) == 33 then   -- '!': UTC
+    pre = "!"
+    s = ssub(s, 2)
+  end
+  -- the broken-down time (gmtime/localtime) must exist
+  local ok, ht = pcall(H.date, pre .. "*t", tt)
+  if not ok or ht == nil then
+    R.rterror("date result cannot be represented in this installation")
+  end
   if s == "*t" then
-    local ht = H.date(pre .. "*t", tt)
     local r = R.newtable()
     for _, k in ipairs(DATE_FIELDS) do R.rawset(r, k, ht[k]) end
     return r
   end
-  local out, i, n = {}, 1, #s
+  local out, no = {}, 0
+  local i, n = 1, #s
   while i <= n do
-    local c = s:sub(i, i)
-    if c ~= "%" then
-      out[#out + 1] = c
-      i = i + 1
-    else
-      local rest = s:sub(i + 1)
-      local cc
-      if rest ~= "" and DATE_SINGLE:find(rest:sub(1, 1), 1, true) then
-        cc = rest:sub(1, 1)
-      elseif DATE_DOUBLE[rest:sub(1, 2)] then
-        cc = rest:sub(1, 2)
-      else
-        R.argerror(1, "date", "invalid conversion specifier '%" .. rest .. "'")
-      end
-      out[#out + 1] = H.date(pre .. "%" .. cc, tt)
-      i = i + 1 + #cc
+    local j = sfind(s, "%", i, true)
+    if j == nil then
+      no = no + 1; out[no] = ssub(s, i)
+      break
     end
+    if j > i then no = no + 1; out[no] = ssub(s, i, j - 1) end
+    local cc
+    if j < n and DATE_SINGLE[sbyte(s, j + 1)] then
+      cc = ssub(s, j + 1, j + 1)
+    elseif DATE_DOUBLE[ssub(s, j + 1, j + 2)] then
+      cc = ssub(s, j + 1, j + 2)
+    else
+      R.argerror(1, "date", "invalid conversion specifier '%" .. ssub(s, j + 1) .. "'")
+    end
+    no = no + 1; out[no] = H.date(pre .. "%" .. cc, tt)
+    i = j + 1 + #cc
   end
-  return table.concat(out)
+  return table.concat(out, "", 1, no)
 end
 
 -- Integer field `key` of date table `tab` (getfield in loslib.c). d < 0 means required.
@@ -77,7 +89,10 @@ local function os_time(tab)
   }
   local isdst = R.noyield(R.index, tab, "isdst")
   if isdst ~= nil then ht.isdst = R.truthy(isdst) end
-  local t = H.time(ht)
+  local ok, t = pcall(H.time, ht)
+  if not ok or t == nil then
+    R.rterror("time result cannot be represented in this installation")
+  end
   -- update the fields with the normalised values, as mktime does
   local norm = H.date("*t", t)
   for _, k in ipairs(DATE_FIELDS) do R.noyield(R.setindex, tab, k, norm[k]) end

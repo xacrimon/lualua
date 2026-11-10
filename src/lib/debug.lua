@@ -1,6 +1,6 @@
 -- lib/debug.lua: a subset of the debug library.
 -- Closures created by compiler.lua are registered in C.FUPS (weak keys):
---   C.FUPS[f] = ups, an array of cells with .names (upvalue names)
+--   C.FUPS[f] = ups, an array of cells with .c (the compiled proto) and .fn
 
 local R = require("runtime")
 local C = require("compiler")
@@ -21,7 +21,8 @@ return function(G)
     local st = R.stack
     for i = st.n, 1, -1 do
       local f = st[i]
-      lines[#lines + 1] = "\t" .. f.src .. ":" .. f.line .. ": in function <" .. f.src .. ">"
+      local src = f.up.c.src
+      lines[#lines + 1] = "\t" .. src .. ":" .. f.line .. ": in function <" .. src .. ">"
     end
     lines[#lines + 1] = "\t[C]: in ?"
     return table.concat(lines, "\n")
@@ -29,28 +30,36 @@ return function(G)
 
   -- splits a call description such as "global 'f'" into namewhat and name
   local function splitdesc(desc)
-    if desc == nil then return nil, nil end
-    local kind, name = desc:match("^(%S+) '(.*)'$")
-    if kind == "for" then kind = "for iterator" end
-    return name, kind
+    if not desc then return nil, nil end
+    local q = string.find(desc, "'", 1, true)
+    return string.sub(desc, q + 1, -2), string.sub(desc, 1, q - 2)
   end
+
+  local GETINFO_OPTS = {}
+  for _, c in ipairs({ "S", "l", "n", "r", "u", "t", "f", "L" }) do GETINFO_OPTS[string.byte(c)] = true end
 
   local function getinfo(a, opts)
     local t = R.newtable()
     local st = R.stack
     if opts ~= nil then
       opts = R.checkstring(opts, 2, "getinfo")
-      if opts:find("[^SlnrutfL]") then R.argerror(2, "getinfo", "invalid option") end
+      for i = 1, #opts do
+        if not GETINFO_OPTS[string.byte(opts, i)] then R.argerror(2, "getinfo", "invalid option") end
+      end
     end
     if type(a) == "number" then
       if a < 0 or a > st.n then return nil end
       if a == 0 then return nil end
       local f = st[st.n - a + 1]
       if f then
+        local c = f.up.c
+        t.hash.func = f.up.fn
         t.hash.currentline = f.line
-        t.hash.short_src = f.src
-        t.hash.source = f.source
-        t.hash.what = "Lua"
+        t.hash.short_src = c.src
+        t.hash.source = c.source
+        t.hash.linedefined = c.line
+        t.hash.lastlinedefined = c.lastline
+        t.hash.what = (c.line == 0) and "main" or "Lua"
         t.hash.extraargs = f.va and f.va.n or 0
         -- the name is recorded by the caller, one frame up
         local caller = st[st.n - a]
@@ -62,11 +71,12 @@ return function(G)
       t.hash.func = a
       local info = C.FUPS[a]
       if info then
-        t.hash.what = "Lua"
-        t.hash.short_src = info.short
-        t.hash.source = info.source
-        t.hash.linedefined = info.line
-        t.hash.lastlinedefined = info.lastline
+        local c = info.c
+        t.hash.what = (c.line == 0) and "main" or "Lua"
+        t.hash.short_src = c.src
+        t.hash.source = c.source
+        t.hash.linedefined = c.line
+        t.hash.lastlinedefined = c.lastline
       else
         t.hash.what = "C"
         t.hash.short_src = "[C]"
@@ -82,18 +92,20 @@ return function(G)
 
   -- upvalue access: the closure must have been created by compiler.lua
   local function getupvalue(f, n)
+    R.checkfunction(f, 1, "getupvalue")
     n = R.checkinteger(n, 2, "getupvalue")
     local info = C.FUPS[f]
     if not info or n < 1 or n > #info then return nil end
-    return info.names[n], info[n].v
+    return info.c.upnames[n], info[n].v
   end
 
   local function setupvalue(f, n, v)
+    R.checkfunction(f, 1, "setupvalue")
     n = R.checkinteger(n, 2, "setupvalue")
     local info = C.FUPS[f]
     if not info or n < 1 or n > #info then return nil end
     info[n].v = v
-    return info.names[n]
+    return info.c.upnames[n]
   end
 
   local function upvalueid(f, n)
@@ -129,8 +141,12 @@ return function(G)
     setupvalue = setupvalue,
     upvalueid = upvalueid,
     upvaluejoin = upvaluejoin,
-    getmetatable = function(v) return R.getmt(v) end,
+    getmetatable = function(...)
+      if select("#", ...) == 0 then R.argerror(1, "getmetatable", "value expected") end
+      return R.getmt((...))
+    end,
     setmetatable = function(v, mt)
+      if mt ~= nil and not R.isTable(mt) then R.typeerror(2, "setmetatable", "nil or table", mt) end
       if R.isTable(v) or R.isUserdata(v) then
         R.setmetatable(v, mt)
       else

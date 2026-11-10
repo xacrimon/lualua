@@ -21,6 +21,7 @@ local type, getmetatable, setmetatable = type, getmetatable, setmetatable
 local tostring, tonumber, next = tostring, tonumber, next
 local mtype, tointeger = math.type, math.tointeger
 local unpack, pack = table.unpack, table.pack
+local sfind, ssub, sbyte = string.find, string.sub, string.byte
 local error = error
 
 local TableMT = {}      -- host metatable marking Lua tables
@@ -56,12 +57,16 @@ R.stack = { n = 0 }
 -- (level 1 = innermost Lua function). Empty string if there is no such frame.
 local function where(level)
   local st = R.stack
-  -- a native called directly by another native (e.g. pcall(error, msg)) has
-  -- no Lua caller, so it gets no position: st.nat is the depth of such a call
-  if level == 1 and st.nat == st.n then return "" end
   local i = st.n - level + 1
-  local f = i >= 1 and st[i]
-  if f then return f.src .. ":" .. f.line .. ": " end
+  -- a native called directly by another native (e.g. pcall(error, msg)) has
+  -- no Lua caller, so level 1 has no position and level 2 is the top Lua frame:
+  -- st.nat is the depth of such a call
+  if st.nat == st.n then
+    if level == 1 then return "" end
+    i = i + 1
+  end
+  local f = i >= 1 and i <= st.n and st[i]
+  if f then return f.up.c.src .. ":" .. f.line .. ": " end
   return ""
 end
 R.where = where
@@ -77,6 +82,46 @@ local function rterror(msg)
   error(where(1) .. msg, 0)
 end
 R.rterror = rterror
+
+-- Short names of the chunks loaded by lualua (registered by loader.lua).
+R.chunknames = {}
+
+-- The overflow text of a stack overflow raised by the host itself (its Lua
+-- stack ran out before MAXDEPTH was reached), or nil. Such a message carries
+-- the position of a lualua source file, which is not a loaded chunk.
+local function hostoverflow(e)
+  if type(e) ~= "string" then return nil end
+  local text = "stack overflow"
+  if ssub(e, -16) == "C stack overflow" then text = "C stack overflow"
+  elseif ssub(e, -14) ~= text then return nil end
+  local p = #e - #text   -- index of the space before the text
+  if ssub(e, p - 1, p) ~= ": " then return nil end
+  local q = p - 2        -- last digit of the line number
+  while q > 0 and (sbyte(e, q) or 0) >= 48 and sbyte(e, q) <= 57 do q = q - 1 end
+  if q == p - 2 or q < 2 or sbyte(e, q) ~= 58 then return nil end
+  if R.chunknames[ssub(e, 1, q - 1)] then return nil end
+  return text
+end
+
+-- Unwinds the frame stack to depth n after an error caught with the host pcall,
+-- and returns the error object to propagate. The dead frames are cleared (they
+-- would keep their values alive), and a host stack overflow becomes a Lua one,
+-- positioned at the innermost frame.
+function R.popto(n, e)
+  local st = R.stack
+  local text = hostoverflow(e)
+  if text then
+    local f = st[st.n]
+    e = (f and (f.up.c.src .. ":" .. f.line .. ": ") or "") .. text
+  end
+  local i = n + 1
+  while st[i] ~= nil do
+    st[i] = nil
+    i = i + 1
+  end
+  st.n = n
+  return e
+end
 
 -- The Lua frame that called the running native, or nil if a native called it
 -- (no Lua call site: the function is then named by its global name).
@@ -105,7 +150,7 @@ local function qualifiedname(fname, fobj)
         end
       end
     end
-    if fobj ~= nil then return fname end   -- known function, not in a loaded module
+    if fobj ~= nil then return "?" end   -- known function, not in a loaded module
     if R.isTable(g) and type(g.hash[fname]) == "function" then return fname end
     local k, mod = next(loaded.hash, nil)
     while k ~= nil do
@@ -118,18 +163,38 @@ local function qualifiedname(fname, fobj)
   return fname
 end
 
+-- As luaL_argerror: the function is named by its call site (cdesc, "kind 'name'"),
+-- or else by its global name.
 local function argerror(n, fname, msg)
   local st = R.stack
   local cf = callerframe()
   local desc = cf and cf.cdesc
-  if desc and desc:sub(1, 8) == "method '" then
-    -- method call: the receiver is argument 1 for the call but not for the function
-    n = n - 1
-    if n == 0 then rterror("calling '" .. fname .. "' on bad self (" .. msg .. ")") end
+  if desc then
+    local q = sfind(desc, "'", 1, true)
+    local name = ssub(desc, q + 1, -2)
+    if ssub(desc, 1, q - 2) == "method" then
+      -- method call: the receiver is argument 1 for the call but not for the function
+      n = n - 1
+      if n == 0 then rterror("calling '" .. name .. "' on bad self (" .. msg .. ")") end
+    end
+    fname = name
+  else
+    fname = qualifiedname(fname, cf == nil and st.natfn or nil)
   end
-  if cf == nil then fname = qualifiedname(fname, st.natfn) end
   rterror("bad argument #" .. n .. " to '" .. fname .. "' (" .. msg .. ")")
 end
+
+-- Records the description and argument count of a call made by the running Lua
+-- frame other than through a call expression (metamethods, iterators), for
+-- argument errors and debug.getinfo names.
+local function setcalldesc(desc, nargs)
+  local st = R.stack
+  if st.nat ~= st.n then
+    local f = st[st.n]
+    if f then f.cdesc, f.nargs = desc, nargs end
+  end
+end
+R.setcalldesc = setcalldesc
 R.argerror = argerror
 
 ---------------------------------------------------------------------------
@@ -210,7 +275,6 @@ local function weakmt(mode)
   return m
 end
 
--- Runs the Lua finalizer of an object collected by the host.
 -- Runs op(...) for a library function that calls Lua values (metamethods, reader
 -- functions, ...): the coroutine's non-yieldable depth is raised for the duration.
 -- Results are passed through; the depth is restored on normal return (an error
@@ -371,7 +435,10 @@ local function index(o, k, desc)
         rterror("attempt to index a " .. objtypename(o) .. " value" .. varinfo(desc))
       end
     end
-    if type(h) == "function" then return (h(o, k)) end
+    if type(h) == "function" then
+      setcalldesc("metamethod 'index'", 2)
+      return (h(o, k))
+    end
     o = h
     desc = nil
   end
@@ -406,6 +473,7 @@ local function setindex(o, k, v, desc)
       end
     end
     if type(h) == "function" then
+      setcalldesc("metamethod 'newindex'", 3)
       h(o, k, v)
       return
     end
@@ -420,7 +488,8 @@ R.setindex = setindex
 -- Numbers and coercions
 ---------------------------------------------------------------------------
 
--- Number value of v for arithmetic (numbers and numeric strings), or nil.
+-- Number value of v for library arguments (numbers and numeric strings), or nil.
+-- Arithmetic operators do not coerce strings: the string metamethods do (lstrlib.c).
 local function tonum(v)
   local t = type(v)
   if t == "number" then return v end
@@ -429,7 +498,7 @@ local function tonum(v)
 end
 R.tonum = tonum
 
--- Integer value of v for bitwise operations, or nil.
+-- Integer value of v (numbers and numeric strings), or nil (lua_tointegerx).
 local function tointeger_v(v)
   local x = tonum(v)
   if x == nil then return nil end
@@ -438,14 +507,10 @@ end
 R.tointegerv = tointeger_v
 
 -- Lua `tonumber(v)`: number, numeric string converted, or nil.
-function R.tonumber(v)
-  return tonum(v)
-end
+R.tonumber = tonum
 
 -- Lua `math.tointeger`-like conversion (numbers and numeric strings).
-function R.tointeger(v)
-  return tointeger_v(v)
-end
+R.tointeger = tointeger_v
 
 ---------------------------------------------------------------------------
 -- Arithmetic
@@ -453,127 +518,147 @@ end
 
 -- Calls metamethod h for event ev; errors name it as "metamethod 'add'".
 local function mmcall(ev, h, a, b)
-  return (callx("metamethod '" .. ev:sub(3) .. "'", h, a, b))
+  local desc = "metamethod '" .. ssub(ev, 3) .. "'"
+  setcalldesc(desc, 2)
+  return (callx(desc, h, a, b))
 end
 
+-- luaT_trybinTM for arithmetic: the operands are not both numbers.
 local function arithmeta(ev, a, b, da, db)
-  local h = metamethod(a, ev) or metamethod(b, ev)
+  local h = metamethod(a, ev)
+  if h == nil then h = metamethod(b, ev) end
   if h ~= nil then return mmcall(ev, h, a, b) end
-  -- blame the first operand that is not a number
+  -- luaG_opinterror: blame the first operand that is not a number
   local culprit, d = b, db
-  if tonum(a) == nil then culprit, d = a, da end
+  if type(a) ~= "number" then culprit, d = a, da end
   rterror("attempt to perform arithmetic on a " .. objtypename(culprit) .. " value" .. varinfo(d))
 end
 
 local function bitmeta(ev, a, b, da, db)
-  local h = metamethod(a, ev) or metamethod(b, ev)
+  local h = metamethod(a, ev)
+  if h == nil then h = metamethod(b, ev) end
   if h ~= nil then return mmcall(ev, h, a, b) end
-  if tonum(a) ~= nil and tonum(b) ~= nil then
-    -- blame the operand that has no integer representation
-    local d = (tointeger_v(a) == nil) and da or db
+  if type(a) == "number" and type(b) == "number" then
+    -- luaG_tointerror: blame the operand that has no integer representation
+    local d = (tointeger(a) == nil) and da or db
     rterror("number" .. varinfo(d) .. " has no integer representation")
   end
   local culprit, d = b, db
-  if tonum(a) == nil then culprit, d = a, da end
+  if type(a) ~= "number" then culprit, d = a, da end
   rterror("attempt to perform bitwise operation on a " .. objtypename(culprit) .. " value" .. varinfo(d))
 end
 
+-- Raw arithmetic on two numbers (luaO_rawarith); idiv and mod check for an
+-- integer zero divisor. Errors carry no position: callers add it if needed.
+local function arith_mod(x, y)
+  if y == 0 and mtype(x) == "integer" and mtype(y) == "integer" then
+    error("attempt to perform 'n%0'", 0)
+  end
+  return x % y
+end
+local function arith_idiv(x, y)
+  if y == 0 and mtype(x) == "integer" and mtype(y) == "integer" then
+    error("attempt to divide by zero", 0)
+  end
+  return x // y
+end
+R.arith_mod, R.arith_idiv = arith_mod, arith_idiv
+
 function R.add(a, b, da, db)
-  local x, y = tonum(a), tonum(b)
-  if x and y then return x + y end
+  if type(a) == "number" and type(b) == "number" then return a + b end
   return arithmeta("__add", a, b, da, db)
 end
 
 function R.sub(a, b, da, db)
-  local x, y = tonum(a), tonum(b)
-  if x and y then return x - y end
+  if type(a) == "number" and type(b) == "number" then return a - b end
   return arithmeta("__sub", a, b, da, db)
 end
 
 function R.mul(a, b, da, db)
-  local x, y = tonum(a), tonum(b)
-  if x and y then return x * y end
+  if type(a) == "number" and type(b) == "number" then return a * b end
   return arithmeta("__mul", a, b, da, db)
 end
 
 function R.div(a, b, da, db)
-  local x, y = tonum(a), tonum(b)
-  if x and y then return x / y end
+  if type(a) == "number" and type(b) == "number" then return a / b end
   return arithmeta("__div", a, b, da, db)
 end
 
 function R.pow(a, b, da, db)
-  local x, y = tonum(a), tonum(b)
-  if x and y then return x ^ y end
+  if type(a) == "number" and type(b) == "number" then return a ^ b end
   return arithmeta("__pow", a, b, da, db)
 end
 
 function R.mod(a, b, da, db)
-  local x, y = tonum(a), tonum(b)
-  if x and y then
-    if mtype(x) == "integer" and mtype(y) == "integer" then
-      if y == 0 then rterror("attempt to perform 'n%0'") end
+  if type(a) == "number" and type(b) == "number" then
+    if b == 0 and mtype(a) == "integer" and mtype(b) == "integer" then
+      rterror("attempt to perform 'n%0'")
     end
-    return x % y
+    return a % b
   end
   return arithmeta("__mod", a, b, da, db)
 end
 
 function R.idiv(a, b, da, db)
-  local x, y = tonum(a), tonum(b)
-  if x and y then
-    if mtype(x) == "integer" and mtype(y) == "integer" then
-      if y == 0 then rterror("attempt to divide by zero") end
+  if type(a) == "number" and type(b) == "number" then
+    if b == 0 and mtype(a) == "integer" and mtype(b) == "integer" then
+      rterror("attempt to divide by zero")
     end
-    return x // y
+    return a // b
   end
   return arithmeta("__idiv", a, b, da, db)
 end
 
 function R.unm(a, da)
-  local x = tonum(a)
-  if x then return -x end
+  if type(a) == "number" then return -a end
   local h = metamethod(a, "__unm")
-  if h ~= nil then return (call(h, a, a)) end
+  if h ~= nil then return mmcall("__unm", h, a, a) end
   rterror("attempt to perform arithmetic on a " .. objtypename(a) .. " value" .. varinfo(da))
 end
 
+-- Integer operands of a bitwise operation: numbers with an exact integer value.
+local function bitint(v)
+  if mtype(v) == "integer" then return v end
+  if type(v) == "number" then return tointeger(v) end
+  return nil
+end
+
 function R.band(a, b, da, db)
-  local x, y = tointeger_v(a), tointeger_v(b)
+  local x, y = bitint(a), bitint(b)
   if x and y then return x & y end
   return bitmeta("__band", a, b, da, db)
 end
 
 function R.bor(a, b, da, db)
-  local x, y = tointeger_v(a), tointeger_v(b)
+  local x, y = bitint(a), bitint(b)
   if x and y then return x | y end
   return bitmeta("__bor", a, b, da, db)
 end
 
 function R.bxor(a, b, da, db)
-  local x, y = tointeger_v(a), tointeger_v(b)
+  local x, y = bitint(a), bitint(b)
   if x and y then return x ~ y end
   return bitmeta("__bxor", a, b, da, db)
 end
 
 function R.shl(a, b, da, db)
-  local x, y = tointeger_v(a), tointeger_v(b)
+  local x, y = bitint(a), bitint(b)
   if x and y then return x << y end
   return bitmeta("__shl", a, b, da, db)
 end
 
 function R.shr(a, b, da, db)
-  local x, y = tointeger_v(a), tointeger_v(b)
+  local x, y = bitint(a), bitint(b)
   if x and y then return x >> y end
   return bitmeta("__shr", a, b, da, db)
 end
 
 function R.bnot(a, da)
-  local x = tointeger_v(a)
+  local x = bitint(a)
   if x then return ~x end
   local h = metamethod(a, "__bnot")
-  if h ~= nil then return (call(h, a, a)) end
-  if tonum(a) ~= nil then rterror("number has no integer representation") end
+  if h ~= nil then return mmcall("__bnot", h, a, a) end
+  if type(a) == "number" then rterror("number" .. varinfo(da) .. " has no integer representation") end
   rterror("attempt to perform bitwise operation on a " .. objtypename(a) .. " value" .. varinfo(da))
 end
 
@@ -586,16 +671,22 @@ local function truthy(v)
 end
 R.truthy = truthy
 
+-- a == b; __eq is tried only between two tables or two userdata.
 function R.eq(a, b)
   if a == b then return true end
   if type(a) ~= "table" or type(b) ~= "table" then return false end
   local ca, cb = getmetatable(a), getmetatable(b)
-  if not (isTableClass(ca) or isUserdataClass(ca)) or not (isTableClass(cb) or isUserdataClass(cb)) then
+  if isTableClass(ca) then
+    if not isTableClass(cb) then return false end
+  elseif isUserdataClass(ca) then
+    if not isUserdataClass(cb) then return false end
+  else
     return false
   end
-  local h = metamethod(a, "__eq") or metamethod(b, "__eq")
+  local h = metamethod(a, "__eq")
+  if h == nil then h = metamethod(b, "__eq") end
   if h == nil then return false end
-  return truthy((call(h, a, b)))
+  return truthy((mmcall("__eq", h, a, b)))
 end
 
 local function cmperror(a, b)
@@ -609,7 +700,8 @@ end
 function R.lt(a, b)
   local ta, tb = type(a), type(b)
   if (ta == "number" or ta == "string") and ta == tb then return a < b end
-  local h = metamethod(a, "__lt") or metamethod(b, "__lt")
+  local h = metamethod(a, "__lt")
+  if h == nil then h = metamethod(b, "__lt") end
   if h == nil then cmperror(a, b) end
   return truthy((mmcall("__lt", h, a, b)))
 end
@@ -617,7 +709,8 @@ end
 function R.le(a, b)
   local ta, tb = type(a), type(b)
   if (ta == "number" or ta == "string") and ta == tb then return a <= b end
-  local h = metamethod(a, "__le") or metamethod(b, "__le")
+  local h = metamethod(a, "__le")
+  if h == nil then h = metamethod(b, "__le") end
   if h == nil then cmperror(a, b) end
   return truthy((mmcall("__le", h, a, b)))
 end
@@ -627,10 +720,11 @@ function R.concat(a, b, da, db)
   if (ta == "string" or ta == "number") and (tb == "string" or tb == "number") then
     return a .. b
   end
-  local h = metamethod(a, "__concat") or metamethod(b, "__concat")
+  local h = metamethod(a, "__concat")
+  if h == nil then h = metamethod(b, "__concat") end
   if h ~= nil then return mmcall("__concat", h, a, b) end
-  local culprit, d = b, db
-  if ta == "string" or ta == "number" then culprit, d = b, db else culprit, d = a, da end
+  local culprit, d = a, da
+  if ta == "string" or ta == "number" then culprit, d = b, db end
   rterror("attempt to concatenate a " .. objtypename(culprit) .. " value" .. varinfo(d))
 end
 
@@ -638,7 +732,7 @@ end
 local function len(v, desc)
   if type(v) == "string" then return #v end
   local h = metamethod(v, "__len")
-  if h ~= nil then return (call(h, v, v)) end   -- like Lua, the operand is passed twice
+  if h ~= nil then return mmcall("__len", h, v, v) end   -- like Lua, the operand is passed twice
   if isTable(v) then return rawlen(v) end
   rterror("attempt to get length of a " .. objtypename(v) .. " value" .. varinfo(desc))
 end
@@ -648,30 +742,30 @@ R.len = len
 -- tostring
 ---------------------------------------------------------------------------
 
--- Address part of the host representation, e.g. "0x5581...".
+-- Address part of the host representation ("table: 0x5581..." -> "0x5581...").
 local function addr_of(v)
-  return (tostring(v):gsub("^[^:]+: ", ""))
+  local s = tostring(v)
+  local i = sfind(s, ": ", 1, true)
+  return i and ssub(s, i + 2) or s
 end
 
--- Lua `tostring(v)` (honours __tostring and __name).
+-- Lua `tostring(v)` (luaL_tolstring: honours __tostring and __name).
 local function tostr(v)
   local t = type(v)
   if t == "string" then return v end
-  if t == "number" then return tostring(v) end
-  if t == "nil" or t == "boolean" then return tostring(v) end
+  if t == "number" or t == "nil" or t == "boolean" then return tostring(v) end
   local h = metamethod(v, "__tostring")
   if h ~= nil then
-    local s = (R.noyield(call, h, v))
+    -- called from a C function: not yieldable, and no Lua call site
+    local s = (R.ccall(h, v))
     if type(s) == "number" then return tostring(s) end
     if type(s) ~= "string" then rterror("'__tostring' must return a string") end
     return s
   end
-  local lt = ltype(v)
-  local name = metamethod(v, "__name")
-  if type(name) == "string" and (lt == "table" or lt == "userdata") then
-    return name .. ": " .. addr_of(v)
-  end
-  if lt == "table" or lt == "userdata" then
+  if t == "table" then
+    local lt = ltype(v)
+    local name = metamethod(v, "__name")
+    if type(name) == "string" then lt = name end
     return lt .. ": " .. addr_of(v)
   end
   return tostring(v)
@@ -743,6 +837,30 @@ end
 function R.checkfunction(v, n, fname)
   if type(v) ~= "function" then typeerror(n, fname, "function", v) end
   return v
+end
+
+---------------------------------------------------------------------------
+-- Numeric helpers shared by the libraries
+---------------------------------------------------------------------------
+
+-- m * 2^e without intermediate overflow or underflow (C ldexp).
+function R.ldexp(m, e)
+  while e > 1000 do m = m * 2.0 ^ 1000; e = e - 1000 end
+  while e < -1000 do m = m * 2.0 ^ -1000; e = e + 1000 end
+  return m * 2.0 ^ e
+end
+
+-- floor(log2(x)) for finite x > 0.
+function R.floorlog2(x)
+  local e = math.floor(math.log(x, 2))
+  while 2.0 ^ e > x do e = e - 1 end
+  while 2.0 ^ (e + 1) <= x do e = e + 1 end
+  return e
+end
+
+-- A seed from the time and the clock (luai_makeseed / l_randomizePivot).
+function R.makeseed()
+  return os.time() * 1000003 + math.floor(os.clock() * 1e6)
 end
 
 ---------------------------------------------------------------------------

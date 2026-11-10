@@ -8,7 +8,7 @@ local R = require("runtime")
 
 local sbyte, schar, ssub, sformat = string.byte, string.char, string.sub, string.format
 local concat, unpack = table.concat, table.unpack
-local mtype, floor, log = math.type, math.floor, math.log
+local mtype = math.type
 local select, tostring = select, tostring
 
 local checkinteger, optinteger = R.checkinteger, R.optinteger
@@ -41,10 +41,15 @@ local function mkset(str)
   return t
 end
 
+-- s repeated n times, built by doubling (memory stays linear in the result).
 local function srep(s, n)
-  local t = {}
-  for i = 1, n do t[i] = s end
-  return concat(t)
+  local r = ""
+  while n > 0 do
+    if n & 1 == 1 then r = r .. s end
+    n = n >> 1
+    if n > 0 then s = s .. s end
+  end
+  return r
 end
 
 -- First index >= i where byte c occurs in s, or nil.
@@ -352,12 +357,17 @@ local function nospecials(p)
 end
 
 -- Plain search of p in s starting at 1-based init; returns start or nil.
+-- As lmemfind: look for the first byte, then compare the rest in place.
 local function lmemfind(s, init, p)
   local lp = #p
   if lp == 0 then return init end
   local first = sbyte(p, 1)
   for i = init, #s - lp + 1 do
-    if sbyte(s, i) == first and ssub(s, i, i + lp - 1) == p then return i end
+    if sbyte(s, i) == first then
+      local k = 2
+      while k <= lp and sbyte(s, i + k - 1) == sbyte(p, k) do k = k + 1 end
+      if k > lp then return i end
+    end
   end
   return nil
 end
@@ -425,23 +435,27 @@ local function gmatch(s, p, init)
   end
 end
 
+-- Buffers (luaL_Buffer) are arrays of pieces buf[1 .. buf.n].
+
 -- Append the expansion of a replacement string news for match [s, e).
 local function add_s(ms, buf, s, e, news)
-  local i = 1
+  local i, l, n = 1, #news, buf.n
   while true do
     local j = findbyte(news, L_ESC, i)
     if not j then
-      buf[#buf + 1] = ssub(news, i)
+      if i <= l then n = n + 1; buf[n] = ssub(news, i) end
+      buf.n = n
       return
     end
-    buf[#buf + 1] = ssub(news, i, j - 1)
+    if j > i then n = n + 1; buf[n] = ssub(news, i, j - 1) end
     local c = sbyte(news, j + 1)
+    n = n + 1
     if c == L_ESC then
-      buf[#buf + 1] = "%"
+      buf[n] = "%"
     elseif c == 48 then
-      buf[#buf + 1] = ssub(ms.src, s, e - 1)
+      buf[n] = ssub(ms.src, s, e - 1)
     elseif c and c >= 49 and c <= 57 then
-      buf[#buf + 1] = tostring(get_onecapture(ms, c - 48, s, e))
+      buf[n] = tostring(get_onecapture(ms, c - 48, s, e))
     else
       rterror("invalid use of '%' in replacement string")
     end
@@ -456,20 +470,22 @@ local function add_value(ms, buf, s, e, repl, tr)
     local caps, n = getcaps(ms, s, e)
     v = (R.ccall(repl, unpack(caps, 1, n)))
   elseif tr == "table" then
-    v = R.index(repl, (get_onecapture(ms, 1, s, e)))
+    v = R.noyield(R.index, repl, (get_onecapture(ms, 1, s, e)))
   else
     add_s(ms, buf, s, e, repl)
     return true
   end
+  local n = buf.n + 1
+  buf.n = n
   if v == nil or v == false then
-    buf[#buf + 1] = ssub(ms.src, s, e - 1)
+    buf[n] = ssub(ms.src, s, e - 1)
     return false
   end
   local tv = R.type(v)
   if tv ~= "string" and tv ~= "number" then
     rterror("invalid replacement value (a " .. tv .. ")")
   end
-  buf[#buf + 1] = tostring(v)
+  buf[n] = tostring(v)
   return true
 end
 
@@ -489,17 +505,22 @@ local function gsub(src, p, repl, maxn)
   local anchor = sbyte(p, 1) == 94
   local pstart = anchor and 2 or 1
   local ms = newstate(src, p)
-  local buf, n, changed = {}, 0, false
-  local pos, lastmatch = 1, nil
+  local buf, n, changed = { n = 0 }, 0, false
+  -- src[copy .. pos-1] is unmatched text not yet in the buffer
+  local pos, copy, lastmatch = 1, 1, nil
   while n < maxs do
     reprep(ms)
     local e = do_match(ms, pos, pstart)
     if e and e ~= lastmatch then
       n = n + 1
+      if copy < pos then
+        local nb = buf.n + 1
+        buf[nb] = ssub(src, copy, pos - 1)
+        buf.n = nb
+      end
       changed = add_value(ms, buf, pos, e, repl, tr) or changed
-      pos, lastmatch = e, e
+      pos, copy, lastmatch = e, e, e
     elseif pos <= srcl then
-      buf[#buf + 1] = ssub(src, pos, pos)
       pos = pos + 1
     else
       break
@@ -507,8 +528,9 @@ local function gsub(src, p, repl, maxn)
     if anchor then break end
   end
   if not changed then return src, n end
-  buf[#buf + 1] = ssub(src, pos)
-  return concat(buf), n
+  local nb = buf.n + 1
+  buf[nb] = ssub(src, copy)
+  return concat(buf, "", 1, nb), n
 end
 
 ---------------------------------------------------------------------------
@@ -598,23 +620,29 @@ local function addrof(v)
 end
 
 local function addquoted(s)
-  local out = { '"' }
+  local out, no = { '"' }, 1
+  local run = 1   -- s[run .. i-1] needs no escape and is not yet in out
   for i = 1, #s do
     local c = sbyte(s, i)
+    local esc
     if c == 34 or c == 92 or c == 10 then
-      out[#out + 1] = "\\" .. schar(c)
+      esc = "\\" .. schar(c)
     elseif c < 32 or c == 127 then
       if isdigit(sbyte(s, i + 1)) then
-        out[#out + 1] = sformat("\\%03d", c)
+        esc = sformat("\\%03d", c)
       else
-        out[#out + 1] = sformat("\\%d", c)
+        esc = sformat("\\%d", c)
       end
-    else
-      out[#out + 1] = schar(c)
+    end
+    if esc then
+      if run < i then no = no + 1; out[no] = ssub(s, run, i - 1) end
+      no = no + 1; out[no] = esc
+      run = i + 1
     end
   end
-  out[#out + 1] = '"'
-  return concat(out)
+  if run <= #s then no = no + 1; out[no] = ssub(s, run) end
+  no = no + 1; out[no] = '"'
+  return concat(out, "", 1, no)
 end
 
 local function addliteral(v, arg)
@@ -699,16 +727,16 @@ local function str_format(...)
   local args = { ... }
   local fmt = checkstring(args[1], 1, "format")
   local n = #fmt
-  local buf = {}
+  local buf, nb = {}, 0
   local i, arg = 1, 1
   while i <= n do
     if sbyte(fmt, i) ~= L_ESC then
       local j = i + 1
       while j <= n and sbyte(fmt, j) ~= L_ESC do j = j + 1 end
-      buf[#buf + 1] = ssub(fmt, i, j - 1)
+      nb = nb + 1; buf[nb] = ssub(fmt, i, j - 1)
       i = j
     elseif sbyte(fmt, i + 1) == L_ESC then
-      buf[#buf + 1] = "%"
+      nb = nb + 1; buf[nb] = "%"
       i = i + 2
     else
       i = i + 1
@@ -720,10 +748,10 @@ local function str_format(...)
       local full = ssub(fmt, i, j)          -- spec plus conversion letter
       local conv = ssub(fmt, j, j)
       i = j + 1
-      buf[#buf + 1] = formatone(full, conv, args, arg)
+      nb = nb + 1; buf[nb] = formatone(full, conv, args, arg)
     end
   end
-  return concat(buf)
+  return concat(buf, "", 1, nb)
 end
 
 ---------------------------------------------------------------------------
@@ -738,20 +766,7 @@ local function roundeven(y)
   return math.tointeger(f)
 end
 
--- x * 2^e without intermediate overflow/underflow.
-local function ldexp(m, e)
-  while e > 1000 do m = m * 2.0 ^ 1000; e = e - 1000 end
-  while e < -1000 do m = m * 2.0 ^ -1000; e = e + 1000 end
-  return m * 2.0 ^ e
-end
-
--- floor(log2(x)) for finite x > 0.
-local function floorlog2(x)
-  local e = floor(log(x, 2))
-  while 2.0 ^ e > x do e = e - 1 end
-  while 2.0 ^ (e + 1) <= x do e = e + 1 end
-  return e
-end
+local ldexp, floorlog2 = R.ldexp, R.floorlog2
 
 -- IEEE-754 double bits (as a Lua integer) of x.
 local function f64bits(x)
@@ -951,12 +966,12 @@ local function str_pack(...)
   local args = { ... }
   local fmt = checkstring(args[1], 1, "pack")
   local H = newH(fmt, "pack")
-  local out, total, arg = {}, 0, 1
+  local out, no, total, arg = {}, 0, 0, 1
   while H.pos <= #fmt do
     local opt, size, ntoalign = getdetails(H, total)
     if size + ntoalign > MAXSIZE - total then argerror(arg, "pack", "result too long") end
     total = total + ntoalign + size
-    out[#out + 1] = srep("\0", ntoalign)
+    if ntoalign > 0 then no = no + 1; out[no] = srep("\0", ntoalign) end
     local a = arg + 1          -- argument index for value-consuming options
     if opt == "int" then
       local n = checkinteger(args[a], a, "pack")
@@ -964,45 +979,45 @@ local function str_pack(...)
         local lim = 1 << (size * 8 - 1)
         if n < -lim or n >= lim then argerror(a, "pack", "integer overflow") end
       end
-      out[#out + 1] = packint(n, H.little, size, n < 0)
+      no = no + 1; out[no] = packint(n, H.little, size, n < 0)
       arg = a
     elseif opt == "uint" then
       local n = checkinteger(args[a], a, "pack")
       if size < 8 and (n < 0 or n >= (1 << (size * 8))) then
         argerror(a, "pack", "unsigned overflow")
       end
-      out[#out + 1] = packint(n, H.little, size, false)
+      no = no + 1; out[no] = packint(n, H.little, size, false)
       arg = a
     elseif opt == "float" then
-      out[#out + 1] = packint(f32bits(checknumber(args[a], a, "pack")), H.little, 4, false)
+      no = no + 1; out[no] = packint(f32bits(checknumber(args[a], a, "pack")), H.little, 4, false)
       arg = a
     elseif opt == "double" then
-      out[#out + 1] = packint(f64bits(checknumber(args[a], a, "pack")), H.little, 8, false)
+      no = no + 1; out[no] = packint(f64bits(checknumber(args[a], a, "pack")), H.little, 8, false)
       arg = a
     elseif opt == "char" then
       local s = checkstring(args[a], a, "pack")
       if #s > size then argerror(a, "pack", "string longer than given size") end
-      out[#out + 1] = s .. srep("\0", size - #s)
+      no = no + 1; out[no] = s .. srep("\0", size - #s)
       arg = a
     elseif opt == "string" then
       local s = checkstring(args[a], a, "pack")
       if size < 8 and #s >= (1 << (size * 8)) then
         argerror(a, "pack", "string length does not fit in given size")
       end
-      out[#out + 1] = packint(#s, H.little, size, false) .. s
+      no = no + 1; out[no] = packint(#s, H.little, size, false) .. s
       total = total + #s
       arg = a
     elseif opt == "zstr" then
       local s = checkstring(args[a], a, "pack")
       if haszero(s) then argerror(a, "pack", "string contains zeros") end
-      out[#out + 1] = s .. "\0"
+      no = no + 1; out[no] = s .. "\0"
       total = total + #s + 1
       arg = a
     elseif opt == "padding" then
-      out[#out + 1] = "\0"
+      no = no + 1; out[no] = "\0"
     end
   end
-  return concat(out)
+  return concat(out, "", 1, no)
 end
 
 local function str_packsize(fmt)
@@ -1029,35 +1044,35 @@ local function str_unpack(...)
   local pos = posrelatI(optinteger(args[3], 3, "unpack", 1), ld) - 1
   if pos > ld then argerror(3, "unpack", "initial position out of string") end
   local H = newH(fmt, "unpack")
-  local res = {}
+  local res, nr = {}, 0
   while H.pos <= #fmt do
     local opt, size, ntoalign = getdetails(H, pos)
     if ntoalign + size > ld - pos then argerror(2, "unpack", "data string too short") end
     pos = pos + ntoalign
     if opt == "int" or opt == "uint" then
-      res[#res + 1] = unpackint(data, pos, H.little, size, opt == "int")
+      nr = nr + 1; res[nr] = unpackint(data, pos, H.little, size, opt == "int")
     elseif opt == "float" then
-      res[#res + 1] = f32from(unpackint(data, pos, H.little, 4, false))
+      nr = nr + 1; res[nr] = f32from(unpackint(data, pos, H.little, 4, false))
     elseif opt == "double" then
-      res[#res + 1] = f64from(unpackint(data, pos, H.little, 8, false))
+      nr = nr + 1; res[nr] = f64from(unpackint(data, pos, H.little, 8, false))
     elseif opt == "char" then
-      res[#res + 1] = ssub(data, pos + 1, pos + size)
+      nr = nr + 1; res[nr] = ssub(data, pos + 1, pos + size)
     elseif opt == "string" then
       local len = unpackint(data, pos, H.little, size, false)
       if len < 0 or len > ld - pos - size then argerror(2, "unpack", "data string too short") end
-      res[#res + 1] = ssub(data, pos + size + 1, pos + size + len)
+      nr = nr + 1; res[nr] = ssub(data, pos + size + 1, pos + size + len)
       pos = pos + len
     elseif opt == "zstr" then
       local e = findbyte(data, 0, pos + 1)
       local len = e and (e - pos - 1) or (ld - pos)
       if pos + len >= ld then argerror(2, "unpack", "unfinished string for format 'z'") end
-      res[#res + 1] = ssub(data, pos + 1, pos + len)
+      nr = nr + 1; res[nr] = ssub(data, pos + 1, pos + len)
       pos = pos + len + 1
     end
     pos = pos + size
   end
-  res[#res + 1] = pos + 1
-  return unpack(res, 1, #res)
+  nr = nr + 1; res[nr] = pos + 1
+  return unpack(res, 1, nr)
 end
 
 ---------------------------------------------------------------------------
@@ -1099,33 +1114,48 @@ local function str_char(...)
   return concat(t, "", 1, n)
 end
 
-local function str_upper(s)
-  s = checkstring(s, 1, "upper")
-  local t = {}
-  for i = 1, #s do
-    local c = sbyte(s, i)
-    if c >= 97 and c <= 122 then c = c - 32 end
-    t[i] = schar(c)
+-- Bytes are converted in blocks of CHUNK through sbyte/schar (the C code
+-- works on the whole buffer; one string per byte would allocate per byte).
+local CHUNK = 1024
+
+-- s with bytes in [lo, hi] shifted by delta (upper/lower).
+local function mapcase(s, lo, hi, delta)
+  local l = #s
+  local out, no = {}, 0
+  for i = 1, l, CHUNK do
+    local j = i + CHUNK - 1
+    if j > l then j = l end
+    local b = { sbyte(s, i, j) }
+    local m = j - i + 1
+    for k = 1, m do
+      local c = b[k]
+      if c >= lo and c <= hi then b[k] = c + delta end
+    end
+    no = no + 1; out[no] = schar(unpack(b, 1, m))
   end
-  return concat(t)
+  return concat(out, "", 1, no)
+end
+
+local function str_upper(s)
+  return mapcase(checkstring(s, 1, "upper"), 97, 122, -32)
 end
 
 local function str_lower(s)
-  s = checkstring(s, 1, "lower")
-  local t = {}
-  for i = 1, #s do
-    local c = sbyte(s, i)
-    if c >= 65 and c <= 90 then c = c + 32 end
-    t[i] = schar(c)
-  end
-  return concat(t)
+  return mapcase(checkstring(s, 1, "lower"), 65, 90, 32)
 end
 
 local function str_reverse(s)
   s = checkstring(s, 1, "reverse")
-  local t = {}
-  for i = 1, #s do t[i] = ssub(s, #s - i + 1, #s - i + 1) end
-  return concat(t)
+  local out, no = {}, 0
+  for i = #s, 1, -CHUNK do
+    local j = i - CHUNK + 1
+    if j < 1 then j = 1 end
+    local b = { sbyte(s, j, i) }
+    local m = i - j + 1
+    for k = 1, m // 2 do b[k], b[m - k + 1] = b[m - k + 1], b[k] end
+    no = no + 1; out[no] = schar(unpack(b, 1, m))
+  end
+  return concat(out, "", 1, no)
 end
 
 local function str_rep(s, n, sep)
@@ -1137,14 +1167,45 @@ local function str_rep(s, n, sep)
   if l > MAXSIZE - lsep or (l + lsep) > MAXSIZE // n then
     rterror("resulting string too large")
   end
-  local t = {}
-  for i = 1, n do t[i] = s end
-  return concat(t, sep)
+  if lsep == 0 then return srep(s, n) end
+  return s .. srep(sep .. s, n - 1)
 end
 
 local function str_dump(f)
   if R.type(f) ~= "function" then argerror(1, "dump", "Lua function expected") end
   rterror("unable to dump given function")
+end
+
+---------------------------------------------------------------------------
+-- Metamethods: arithmetic on strings converts them to numbers (lstrlib.c)
+---------------------------------------------------------------------------
+
+-- The number value of an operand: a number, or a string that converts entirely.
+local function tonum(v)
+  local t = type(v)
+  if t == "number" then return v end
+  if t == "string" then return tonumber(v) end
+  return nil
+end
+
+-- The operands are not both numeric: the second operand's metamethod is the
+-- only other choice (the first one, if any, was this one).
+local function trymt(a, b, ev, opname)
+  local h
+  if type(b) ~= "string" then h = R.metamethod(b, ev) end
+  if h == nil then
+    rterror("attempt to " .. opname .. " a '" .. R.type(a) .. "' with a '" .. R.type(b) .. "'")
+  end
+  return (R.call(h, a, b))
+end
+
+local function arith(op, ev)
+  local opname = ssub(ev, 3)
+  return function(a, b)
+    local x, y = tonum(a), tonum(b)
+    if x ~= nil and y ~= nil then return op(x, y) end
+    return trymt(a, b, ev, opname)
+  end
 end
 
 ---------------------------------------------------------------------------
@@ -1175,6 +1236,16 @@ return function(G)
   G.hash.string = lib
 
   local mt = R.newtable()
+  R.setfuncs(mt, {
+    __add = arith(function(x, y) return x + y end, "__add"),
+    __sub = arith(function(x, y) return x - y end, "__sub"),
+    __mul = arith(function(x, y) return x * y end, "__mul"),
+    __mod = arith(R.arith_mod, "__mod"),
+    __pow = arith(function(x, y) return x ^ y end, "__pow"),
+    __div = arith(function(x, y) return x / y end, "__div"),
+    __idiv = arith(R.arith_idiv, "__idiv"),
+    __unm = arith(function(x) return -x end, "__unm"),
+  })
   mt.hash.__index = lib
   R.typemt.string = mt
 end

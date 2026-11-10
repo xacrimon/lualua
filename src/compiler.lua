@@ -1,44 +1,50 @@
 -- compiler.lua: turns the AST from parser.lua into Lua closures.
 --
 -- Activation record A (a host table, also the stack frame):
---   A[slot]   value of a local, or a cell {v=value} if the local is captured
---   A.up      array of upvalue cells {v=value}
---   A.va      varargs {n=count, ...} (vararg functions only)
---   A.src, A.line, A.depth   frame information for error positions
+--   A[slot]   value of a local, or a cell {v=value} if the local is captured;
+--             parameters are slots 1..np
+--   A.up      array of upvalue cells {v=value}; A.up.c is the compiled proto
+--             (src, source, line, ...) and A.up.fn the closure
+--   A.va      varargs {n=count, ...} (vararg functions only; never modified)
+--   A.line               current line
+--   A.cdesc, A.nargs     description and argument count of the latest call
 --   A[block]  to-be-closed list of a block (blocks with <close> locals)
 --
 -- Expressions compile to closures f(A) returning exactly one value; "multi"
 -- closures return all values. Statements compile to closures f(A) returning
--- nothing (normal), or a signal: BREAK, RETURN(values table), GOTO(label),
--- TAILCALL({fn, argstable, desc}).
+-- nothing (normal), or a signal: BREAK, GOTO(label), RETURN0, RETURN1(value),
+-- RETURN(values table), TAILCALL(callee; arguments in the TN/T1.. variables).
 
 local R = require("runtime")
 
 local C = {}
 
-local BREAK, RETURN, GOTO, TAILCALL = 1, 2, 3, 4
+local BREAK, RETURN, GOTO, TAILCALL, RETURN0, RETURN1 = 1, 2, 3, 4, 5, 6
+
+-- Arguments of the pending tail call: TN values T1..T3, or (TN < 0) the packed
+-- table T1; TD describes the callee. A tail-call statement sets them and returns
+-- TAILCALL to the function, which reads them right away: no Lua code runs in
+-- between, since a return in the scope of a to-be-closed variable is not a tail call.
+local TN, T1, T2, T3, TD = 0, nil, nil, nil, nil
 
 local type, select, pcall, error = type, select, pcall, error
 local pack, unpack = table.pack, table.unpack
 local mtype = math.type
-local getmetatable = getmetatable
-local TableMT = R.TableMT
 
 local rterror, callx, index, setindex = R.rterror, R.callx, R.index, R.setindex
 local lt, le, eq, concat, len = R.lt, R.le, R.eq, R.concat, R.len
 local add, sub, mul, div, mod, idiv, pow = R.add, R.sub, R.mul, R.div, R.mod, R.idiv, R.pow
 local unm, bnot, band, bor, bxor, shl, shr = R.unm, R.bnot, R.band, R.bor, R.bxor, R.shl, R.shr
-local truthy = R.truthy
 local rawset = R.rawset
 
 local MAXDEPTH = 50000   -- Lua-to-Lua call depth limit (reached sooner than the reference; see DESIGN.md)
--- closure -> its upvalue cells; the cell array also carries .names (upvalue names)
+-- closure -> its upvalue cells; the cell array also carries .c (the compiled
+-- proto: upnames, src, source, line, lastline) and .fn (the closure)
 local FUPS = setmetatable({}, { __mode = "k" })
 C.FUPS = FUPS
 local CURSRC = "?"      -- short chunk name of the chunk being compiled
 local CURSOURCE = "?"   -- the chunk name as given to load
 
--- Description of an expression for error messages ("local 'x'", ...).
 -- Number of values in a named vararg table (its field n must be a proper count).
 local function vacount(t)
   local n = t.hash.n
@@ -46,19 +52,29 @@ local function vacount(t)
   return n
 end
 
+-- Description of an expression for error messages ("local 'x'", ...), as
+-- getobjname in ldebug.c names the register holding it.
 local function describe(node)
   local k = node.k
   if k == "local" then return "local '" .. node.name .. "'" end
   if k == "upval" then return "upvalue '" .. node.name .. "'" end
+  if k == "str" then return "constant '" .. node.v .. "'" end
+  if k == "paren" then return describe(node.e) end
   if k == "index" then
     if node.gname then return "global '" .. node.gname .. "'" end
-    if node.key.k == "str" then return "field '" .. node.key.v .. "'" end
+    local key = node.key
+    if key.k == "str" then return "field '" .. key.v .. "'" end
+    -- small non-negative integer constants use GETI; other keys are registers
+    if key.k == "num" and mtype(key.v) == "integer" and key.v >= 0 and key.v <= 255 then
+      return "field 'integer index'"
+    end
+    return "field '?'"
   end
   if k == "method" then return (node.field and "field '" or "method '") .. node.name .. "'" end
   return nil
 end
 
-local cexpr, cmulti, compile_args, cblock, compile_proto, clearslots
+local cexpr, cmulti, compile_args, fixedargs, cblock, compile_proto, clearslots
 
 local function isMulti(node)
   local k = node.k
@@ -230,12 +246,19 @@ E.binop = function(node)
   elseif op == "==" then
     return function(A)
       local x = a(A)
-      local y = b(A); A.line = line; return eq(x, y)
+      local y = b(A)
+      if x == y then return true end
+      -- only two tables or two userdata can have __eq
+      if type(x) ~= "table" or type(y) ~= "table" then return false end
+      A.line = line; return eq(x, y)
     end
   elseif op == "~=" then
     return function(A)
       local x = a(A)
-      local y = b(A); A.line = line; return not eq(x, y)
+      local y = b(A)
+      if x == y then return false end
+      if type(x) ~= "table" or type(y) ~= "table" then return true end
+      A.line = line; return not eq(x, y)
     end
   elseif op == "<" then
     return function(A)
@@ -287,7 +310,9 @@ E.table = function(node)
   local n = #node.items
   for i, it in ipairs(node.items) do
     if it.kind == "pos" then
-      if i == n and isMulti(it.value) then
+      if i == n and it.value.k == "vararg" and not it.value.var then
+        items[i] = { pos = true, multi = true, va = true }
+      elseif i == n and isMulti(it.value) then
         items[i] = { pos = true, multi = true, fn = cmulti(it.value) }
       else
         items[i] = { pos = true, fn = cexpr(it.value) }
@@ -303,7 +328,11 @@ E.table = function(node)
     for i = 1, n do
       local it = items[i]
       if it.pos then
-        if it.multi then
+        if it.va then
+          local va = A.va
+          for j = 1, va.n do h[idx + j] = va[j] end
+          idx = idx + va.n
+        elseif it.multi then
           local r = pack(it.fn(A))
           for j = 1, r.n do
             idx = idx + 1
@@ -345,82 +374,152 @@ cmulti = function(node)
       return unpack(va, 1, va.n)
     end
   elseif k == "call" then
+    -- the caller records the callee's description and argument count (for
+    -- argument error messages and debug.getinfo names)
     local f = cexpr(node.fn)
-    local argsf = compile_args(node.args)
     local d = describe(node.fn)
     local line = node.line
+    local fa = fixedargs(node.args, 3)
+    if fa then
+      local n, a1, a2, a3 = #fa, fa[1], fa[2], fa[3]
+      if n == 0 then
+        return function(A)
+          local fv = f(A)
+          A.line = line; A.cdesc = d; A.nargs = 0
+          if type(fv) == "function" then return fv() end
+          return callx(d, fv)
+        end
+      elseif n == 1 then
+        return function(A)
+          local fv = f(A)
+          local x = a1(A)
+          A.line = line; A.cdesc = d; A.nargs = 1
+          if type(fv) == "function" then return fv(x) end
+          return callx(d, fv, x)
+        end
+      elseif n == 2 then
+        return function(A)
+          local fv = f(A)
+          local x = a1(A)
+          local y = a2(A)
+          A.line = line; A.cdesc = d; A.nargs = 2
+          if type(fv) == "function" then return fv(x, y) end
+          return callx(d, fv, x, y)
+        end
+      end
+      return function(A)
+        local fv = f(A)
+        local x = a1(A)
+        local y = a2(A)
+        local z = a3(A)
+        A.line = line; A.cdesc = d; A.nargs = 3
+        if type(fv) == "function" then return fv(x, y, z) end
+        return callx(d, fv, x, y, z)
+      end
+    end
+    local argsf = compile_args(node.args)
+    local function site(A, fv, ...)
+      A.line = line; A.cdesc = d; A.nargs = select("#", ...)
+      if type(fv) == "function" then return fv(...) end
+      return callx(d, fv, ...)
+    end
     return function(A)
       local fv = f(A)
-      local a = pack(argsf(A))
-      -- the caller records the callee's description and argument count (for
-      -- argument error messages and debug.getinfo names)
-      A.line = line
-      A.cdesc = d
-      A.nargs = a.n
-      if type(fv) == "function" then return fv(unpack(a, 1, a.n)) end
-      return callx(d, fv, unpack(a, 1, a.n))
+      return site(A, fv, argsf(A))
     end
   elseif k == "method" then
     local o = cexpr(node.obj)
-    local argsf = compile_args(node.args)
     local name = node.name
     local d = describe(node.obj)
     local line = node.line
     local mdesc = (node.field and "field '" or "method '") .. name .. "'"
+    local fa = fixedargs(node.args, 2)
+    if fa then
+      local n, a1, a2 = #fa, fa[1], fa[2]
+      if n == 0 then
+        return function(A)
+          local ob = o(A)
+          local fv = index(ob, name, d)
+          A.line = line; A.cdesc = mdesc; A.nargs = 1   -- the receiver counts
+          if type(fv) == "function" then return fv(ob) end
+          return callx(mdesc, fv, ob)
+        end
+      elseif n == 1 then
+        return function(A)
+          local ob = o(A)
+          local fv = index(ob, name, d)
+          local x = a1(A)
+          A.line = line; A.cdesc = mdesc; A.nargs = 2
+          if type(fv) == "function" then return fv(ob, x) end
+          return callx(mdesc, fv, ob, x)
+        end
+      end
+      return function(A)
+        local ob = o(A)
+        local fv = index(ob, name, d)
+        local x = a1(A)
+        local y = a2(A)
+        A.line = line; A.cdesc = mdesc; A.nargs = 3
+        if type(fv) == "function" then return fv(ob, x, y) end
+        return callx(mdesc, fv, ob, x, y)
+      end
+    end
+    local argsf = compile_args(node.args)
+    local function site(A, fv, ob, ...)
+      A.line = line; A.cdesc = mdesc; A.nargs = select("#", ...) + 1
+      if type(fv) == "function" then return fv(ob, ...) end
+      return callx(mdesc, fv, ob, ...)
+    end
     return function(A)
       local ob = o(A)
       local fv = index(ob, name, d)
-      local a = pack(argsf(A))
-      A.line = line
-      A.cdesc = mdesc
-      A.nargs = a.n + 1   -- the receiver counts
-      if type(fv) == "function" then return fv(ob, unpack(a, 1, a.n)) end
-      return callx(mdesc, fv, ob, unpack(a, 1, a.n))
+      return site(A, fv, ob, argsf(A))
     end
   end
   return cexpr(node)
 end
 
--- Closure returning all values of an expression list (multi-valued).
-compile_args = function(exprs)
+-- Closure returning all values of the expression list exprs[i..] (multi-valued).
+compile_args = function(exprs, i)
+  i = i or 1
   local n = #exprs
-  if n == 0 then
+  if i > n then
     return function() end
   end
   local last = exprs[n]
-  local multi = isMulti(last)
-  if n == 1 then
-    if multi then return cmulti(last) end
-    local e = cexpr(last)
-    return function(A) return e(A) end
-  end
-  local fixed = {}
-  for i = 1, n - 1 do fixed[i] = cexpr(exprs[i]) end
-  local nfix = n - 1
-  if not multi then
-    local lastf = cexpr(last)
-    if nfix == 1 then
-      local a = fixed[1]
-      return function(A)
-        local x = a(A)
-        return x, lastf(A)
-      end
-    end
+  local lastf = isMulti(last) and cmulti(last) or cexpr(last)
+  if i == n then return lastf end
+  local a = cexpr(exprs[i])
+  if i + 1 == n then
     return function(A)
-      local t = {}
-      for i = 1, nfix do t[i] = fixed[i](A) end
-      t[n] = lastf(A)
-      return unpack(t, 1, n)
+      local x = a(A)
+      return x, lastf(A)
     end
   end
-  local lastf = cmulti(last)
-  return function(A)
-    local t = {}
-    for i = 1, nfix do t[i] = fixed[i](A) end
-    local r = pack(lastf(A))
-    for j = 1, r.n do t[nfix + j] = r[j] end
-    return unpack(t, 1, nfix + r.n)
+  local b = cexpr(exprs[i + 1])
+  if i + 2 == n then
+    return function(A)
+      local x = a(A)
+      local y = b(A)
+      return x, y, lastf(A)
+    end
   end
+  local rest = compile_args(exprs, i + 2)
+  return function(A)
+    local x = a(A)
+    local y = b(A)
+    return x, y, rest(A)
+  end
+end
+
+-- Single-value closures of the arguments when there are at most `max` and the
+-- last one is not multi-valued (calls with a fixed argument count); else nil.
+fixedargs = function(exprs, max)
+  local n = #exprs
+  if n > max or (n > 0 and isMulti(exprs[n])) then return nil end
+  local fs = {}
+  for i = 1, n do fs[i] = cexpr(exprs[i]) end
+  return fs
 end
 
 ---------------------------------------------------------------------------
@@ -476,22 +575,37 @@ S["local"] = function(node, blk)
   if nv == 1 and #exprs == 1 and not isMulti(exprs[1]) then
     local vi = vars[1]
     local e = cexpr(exprs[1])
-    local s, cap = vi.slot, vi.captured
-    return function(A)
-      local v = e(A)
-      if cap then A[s] = { v = v } else A[s] = v end
-      if hasclose then checkclose(A, blk, vi, v) end
+    local s = vi.slot
+    if hasclose then
+      local cap = vi.captured
+      return function(A)
+        local v = e(A)
+        if cap then A[s] = { v = v } else A[s] = v end
+        checkclose(A, blk, vi, v)
+      end
     end
+    if vi.captured then
+      return function(A) A[s] = { v = e(A) } end
+    end
+    return function(A) A[s] = e(A) end
   end
   local explist = compile_args(exprs)
+  local function set(A, vi, v)
+    if vi.captured then A[vi.slot] = { v = v } else A[vi.slot] = v end
+    if vi.attrib == "close" then checkclose(A, blk, vi, v) end
+  end
+  if nv <= 3 then
+    local vi1, vi2, vi3 = vars[1], vars[2], vars[3]
+    return function(A)
+      local v1, v2, v3 = explist(A)
+      set(A, vi1, v1)
+      if vi2 then set(A, vi2, v2) end
+      if vi3 then set(A, vi3, v3) end
+    end
+  end
   return function(A)
     local vals = pack(explist(A))
-    for i = 1, nv do
-      local vi = vars[i]
-      local v = vals[i]
-      if vi.captured then A[vi.slot] = { v = v } else A[vi.slot] = v end
-      if vi.attrib == "close" then checkclose(A, blk, vi, v) end
-    end
+    for i = 1, nv do set(A, vars[i], vals[i]) end
   end
 end
 
@@ -512,6 +626,8 @@ end
 S.assign = function(node)
   local targets = node.targets
   local nt = #targets
+  -- the stores happen after the values are computed, on the line where they end
+  local sline = node.sline or node.line
   if nt == 1 and #node.exprs == 1 and not isMulti(node.exprs[1]) then
     local t = ctarget(targets[1])
     local e = cexpr(node.exprs[1])
@@ -520,14 +636,40 @@ S.assign = function(node)
       return function(A)
         local ob = o(A)
         local k = key(A)
-        setindex(ob, k, e(A), d)
+        local v = e(A)
+        A.line = sline
+        setindex(ob, k, v, d)
       end
     end
-    return function(A) storevar(t, A, e(A)) end
+    local s = t.slot
+    if t.kind == "upval" then
+      local idx = t.idx
+      return function(A) A.up[idx].v = e(A) end
+    elseif t.cap then
+      return function(A) A[s].v = e(A) end
+    end
+    return function(A) A[s] = e(A) end
   end
   local tg = {}
   for i, t in ipairs(targets) do tg[i] = ctarget(t) end
   local explist = compile_args(node.exprs)
+  if nt <= 3 then
+    local t1, t2, t3 = tg[1], tg[2], tg[3]
+    local function store(A, t, o, k, v)
+      if t.kind == "index" then setindex(o, k, v, t.d) else storevar(t, A, v) end
+    end
+    return function(A)
+      local o1, k1, o2, k2, o3, k3
+      if t1.kind == "index" then o1 = t1.o(A); k1 = t1.key(A) end
+      if t2 and t2.kind == "index" then o2 = t2.o(A); k2 = t2.key(A) end
+      if t3 and t3.kind == "index" then o3 = t3.o(A); k3 = t3.key(A) end
+      local v1, v2, v3 = explist(A)
+      A.line = sline
+      if t3 then store(A, t3, o3, k3, v3) end
+      if t2 then store(A, t2, o2, k2, v2) end
+      store(A, t1, o1, k1, v1)
+    end
+  end
   return function(A)
     local objs, keys = {}, {}
     for i = 1, nt do
@@ -538,6 +680,7 @@ S.assign = function(node)
       end
     end
     local vals = pack(explist(A))
+    A.line = sline
     for i = nt, 1, -1 do
       local t = tg[i]
       if t.kind == "index" then
@@ -562,7 +705,9 @@ S["while"] = function(node)
   local cond = cexpr(node.cond)
   local body = cblock(node.body)
   return function(A)
-    while truthy(cond(A)) do
+    -- host truthiness is Lua truthiness; the value is not kept in a live
+    -- local, which would keep it from being collected while the body runs
+    while cond(A) do
       local sig, val = body(A)
       if sig then
         if sig == BREAK then break end
@@ -583,9 +728,9 @@ S["repeat"] = function(node)
         if sig == BREAK then break end
         return sig, val
       end
-      local done = truthy(cond(A))
+      local continue = not cond(A)
       clearslots(A, slots)
-    until done
+    until not continue
   end
 end
 
@@ -599,7 +744,7 @@ S["if"] = function(node)
   local elseb = node.elseblock and cblock(node.elseblock)
   return function(A)
     for i = 1, nc do
-      if truthy(conds[i](A)) then return blocks[i](A) end
+      if conds[i](A) then return blocks[i](A) end
     end
     if elseb then return elseb(A) end
   end
@@ -720,40 +865,66 @@ S.genfor = function(node)
   local iterdesc = "for iterator 'for iterator'"
   -- errors in the iterator call report the line where the explist starts
   local iterline = (node.exprs[1] and node.exprs[1].line) or node.line
-  local function runloop(A, f, st, ctrl)
-    while true do
-      A.line = iterline
-      local rs = pack(callx(iterdesc, f, st, ctrl))
-      local v1 = rs[1]
-      if v1 == nil then break end
-      ctrl = v1
-      for j = 1, nv do
-        local vi = vars[j]
-        if vi.captured then A[vi.slot] = { v = rs[j] } else A[vi.slot] = rs[j] end
+  local function setvar(A, vi, v)
+    if vi.captured then A[vi.slot] = { v = v } else A[vi.slot] = v end
+  end
+  local runloop
+  if nv <= 3 then
+    local vi1, vi2, vi3 = vars[1], vars[2], vars[3]
+    runloop = function(A, f, st, ctrl)
+      while true do
+        A.line = iterline
+        A.cdesc = iterdesc; A.nargs = 2
+        local v1, v2, v3
+        if type(f) == "function" then v1, v2, v3 = f(st, ctrl)
+        else v1, v2, v3 = callx(iterdesc, f, st, ctrl) end
+        if v1 == nil then break end
+        ctrl = v1
+        setvar(A, vi1, v1)
+        if vi2 then setvar(A, vi2, v2) end
+        if vi3 then setvar(A, vi3, v3) end
+        local sig, val = body(A)
+        if sig then
+          if sig == BREAK then break end
+          return sig, val
+        end
       end
-      local sig, val = body(A)
-      if sig then
-        if sig == BREAK then break end
-        return sig, val
+    end
+  else
+    runloop = function(A, f, st, ctrl)
+      while true do
+        A.line = iterline
+        A.cdesc = iterdesc; A.nargs = 2
+        local rs = pack(callx(iterdesc, f, st, ctrl))
+        local v1 = rs[1]
+        if v1 == nil then break end
+        ctrl = v1
+        for j = 1, nv do setvar(A, vars[j], rs[j]) end
+        local sig, val = body(A)
+        if sig then
+          if sig == BREAK then break end
+          return sig, val
+        end
       end
     end
   end
   return function(A)
-    local vals = pack(explist(A))
-    local closing = vals[4]
+    local f, st, ctrl, closing = explist(A)
     if closing == nil or closing == false then
-      return runloop(A, vals[1], vals[2], vals[3])
+      return runloop(A, f, st, ctrl)
     end
     -- the fourth value is a to-be-closed variable closed when the loop ends
     local h = R.metamethod(closing, "__close")
     if h == nil then rterror("variable '(for state)' got a non-closable value") end
-    local ok, sig, val = pcall(runloop, A, vals[1], vals[2], vals[3])
+    local depth = R.stack.n   -- this frame is the top one
+    local ok, sig, val = pcall(runloop, A, f, st, ctrl)
     if ok then
       R.call(h, closing)
       return sig, val
     end
-    R.stack.n = A.depth
-    pcall(R.call, h, closing, sig)
+    sig = R.popto(depth, sig)
+    local cok, cerr = pcall(R.call, h, closing, sig)
+    if not cok then sig = R.popto(depth, cerr) end
     error(sig, 0)
   end
 end
@@ -761,35 +932,70 @@ end
 S["return"] = function(node)
   local exprs = node.exprs
   local n = #exprs
-  if n == 1 and not node.notail and (exprs[1].k == "call" or exprs[1].k == "method") then
-    local c = exprs[1]
-    local argsf = compile_args(c.args)
-    if c.k == "call" then
-      local f = cexpr(c.fn)
-      local d = describe(c.fn)
-      local line = c.line
+  local e1 = exprs[1]
+  if n == 1 and not node.notail and (e1.k == "call" or e1.k == "method") then
+    local line = e1.line
+    if e1.k == "call" then
+      local f = cexpr(e1.fn)
+      local d = describe(e1.fn)
+      local fa = fixedargs(e1.args, 3)
+      if fa then
+        local na, a1, a2, a3 = #fa, fa[1], fa[2], fa[3]
+        return function(A)
+          local fv = f(A)
+          local x, y, z
+          if na >= 1 then x = a1(A) end
+          if na >= 2 then y = a2(A) end
+          if na >= 3 then z = a3(A) end
+          A.line = line; A.cdesc = d; A.nargs = na
+          TN, T1, T2, T3, TD = na, x, y, z, d
+          return TAILCALL, fv
+        end
+      end
+      local argsf = compile_args(e1.args)
       return function(A)
         local fv = f(A)
         local args = pack(argsf(A))
-        A.line = line
-        A.cdesc, A.nargs = d, args.n
-        return TAILCALL, { fv, args, d }
+        A.line = line; A.cdesc = d; A.nargs = args.n
+        TN, T1, TD = -1, args, d
+        return TAILCALL, fv
       end
-    else
-      local o = cexpr(c.obj)
-      local name = c.name
-      local d = describe(c.obj)
-      local line = c.line
+    end
+    local o = cexpr(e1.obj)
+    local name = e1.name
+    local d = describe(e1.obj)
+    local mdesc = (e1.field and "field '" or "method '") .. name .. "'"
+    local fa = fixedargs(e1.args, 2)
+    if fa then
+      local na, a1, a2 = #fa, fa[1], fa[2]
       return function(A)
         local ob = o(A)
         local fv = index(ob, name, d)
-        local args = pack(ob, argsf(A))
-        A.line = line
-        local mdesc = (c.field and "field '" or "method '") .. name .. "'"
-        A.cdesc, A.nargs = mdesc, args.n
-        return TAILCALL, { fv, args, mdesc }
+        local x, y
+        if na >= 1 then x = a1(A) end
+        if na >= 2 then y = a2(A) end
+        A.line = line; A.cdesc = mdesc; A.nargs = na + 1
+        TN, T1, T2, T3, TD = na + 1, ob, x, y, mdesc
+        return TAILCALL, fv
       end
     end
+    local argsf = compile_args(e1.args)
+    return function(A)
+      local ob = o(A)
+      local fv = index(ob, name, d)
+      local args = pack(ob, argsf(A))
+      A.line = line; A.cdesc = mdesc; A.nargs = args.n
+      TN, T1, TD = -1, args, mdesc
+      return TAILCALL, fv
+    end
+  end
+  if n == 0 then
+    return function() return RETURN0 end
+  elseif n == 1 and not isMulti(e1) then
+    local e = cexpr(e1)
+    return function(A) return RETURN1, e(A) end
+  elseif n == 1 and e1.k == "vararg" and not e1.var then
+    return function(A) return RETURN, A.va end
   end
   local explist = compile_args(exprs)
   return function(A)
@@ -840,6 +1046,7 @@ end
 -- An error raised by a __close replaces err for the remaining calls.
 -- Returns the final error object (nil if none).
 local function closeall(list, err)
+  local depth = R.stack.n
   for i = #list, 1, -1 do
     local v = list[i]
     local h = R.metamethod(v, "__close")
@@ -857,7 +1064,7 @@ local function closeall(list, err)
       -- closing because of an error (recovered by pcall): the handler may yield
       ok, e2 = pcall(R.call, h, v, err)
     end
-    if not ok then err = e2 end
+    if not ok then err = R.popto(depth, e2) end
   end
   return err
 end
@@ -896,7 +1103,7 @@ cblock = function(block, noclear)
         if sig then return sig, val end
       end
     end
-  else
+  elseif not hasclose then
     run = function(A)
       local i = 1
       while i <= n do
@@ -908,6 +1115,39 @@ cblock = function(block, noclear)
           else
             return sig, val
           end
+        else
+          i = i + 1
+        end
+      end
+    end
+  else
+    -- a backward goto leaves the scope of the to-be-closed variables declared
+    -- after its label: they are closed by the jump
+    local labelat = {}
+    for name, i in pairs(labelpos) do labelat[i] = name end
+    run = function(A)
+      local list = A[block]
+      local marks = {}   -- label -> number of tbc values when the label was passed
+      local i = 1
+      while i <= n do
+        A.line = lines[i]
+        local lb = labelat[i]
+        if lb then marks[lb] = #list end
+        local sig, val = fns[i](A)
+        if sig then
+          local p = sig == GOTO and labelpos[val]
+          if not p then return sig, val end
+          local m = marks[val]
+          if m and #list > m then
+            local leaving = {}
+            for k = m + 1, #list do
+              leaving[k - m] = list[k]
+              list[k] = nil
+            end
+            local e = closeall(leaving, nil)
+            if e ~= nil then error(e, 0) end
+          end
+          i = p
         else
           i = i + 1
         end
@@ -941,14 +1181,14 @@ cblock = function(block, noclear)
     run = function(A)
       local list = {}
       A[block] = list
+      local depth = R.stack.n   -- this frame is the top one
       local ok, sig, val = pcall(inner, A)
       if ok then
         local e = closeall(list, nil)
         if e ~= nil then error(e, 0) end
         return sig, val
       end
-      R.stack.n = A.depth
-      local err = closeall(list, sig)
+      local err = closeall(list, R.popto(depth, sig))
       error(err, 0)
     end
   end
@@ -962,9 +1202,12 @@ end
 -- Compiles a proto once; returns the compiled record used by newlua.
 compile_proto = function(proto)
   if proto.compiled then return proto.compiled end
-  local params = {}
-  for i, vi in ipairs(proto.params) do
-    params[i] = { slot = vi.slot, cap = vi.captured }
+  local caps   -- slots of the captured parameters, or nil
+  for _, vi in ipairs(proto.params) do
+    if vi.captured then
+      caps = caps or {}
+      caps[#caps + 1] = vi.slot
+    end
   end
   local upnames = {}
   for i, u in ipairs(proto.upvals) do upnames[i] = u.name end
@@ -974,8 +1217,8 @@ compile_proto = function(proto)
     source = CURSOURCE,
     lastline = proto.lastline,
     line = proto.line,
-    params = params,
-    np = #params,
+    np = #proto.params,
+    caps = caps,
     isvararg = proto.isvararg,
     udesc = proto.upvals,
   }
@@ -988,65 +1231,132 @@ compile_proto = function(proto)
   return c
 end
 
--- Creates a Lua function value from a compiled proto and its upvalue cells.
-function C.newlua(c, ups)
-  local run, params, np, isvararg = c.run, c.params, c.np, c.isvararg
-  local src, line = c.src, c.line
-  local source = c.source
-  local varslot, varcap = c.varslot, c.varcap
-  ups.names = c.upnames
-  ups.source, ups.short, ups.line = source, src, line
-  ups.lastline = c.lastline
-  local fn = function(...)
-    local A = { up = ups, src = src, line = line, source = source }
-    if np > 0 then
-      local args = { ... }
-      for i = 1, np do
-        local p = params[i]
-        if p.cap then A[p.slot] = { v = args[i] } else A[p.slot] = args[i] end
-      end
-    end
-    if isvararg then
-      local nargs = select("#", ...)
-      if nargs > np then
-        local extra = pack(select(np + 1, ...))
-        A.va = extra
-      else
-        A.va = { n = 0 }
-      end
-    end
-    if varslot then
-      -- named vararg: a Lua table with the extra arguments and field n
-      local t = R.newtable()
-      local va = A.va
-      for j = 1, va.n do t.hash[j] = va[j] end
-      t.hash.n = va.n
-      if varcap then A[varslot] = { v = t } else A[varslot] = t end
-    end
-    local st = R.stack
-    local d = st.n + 1
-    if d > MAXDEPTH then rterror("stack overflow") end
-    A.depth = d
-    st[d] = A
-    st.n = d
-    local sig, val = run(A)
-    if sig == TAILCALL and FUPS[val[1]] == nil then
+local EMPTYVA = { n = 0 }   -- the varargs of a call without extra arguments
+
+-- Results of the pending tail call's arguments (see TN).
+local function tailargs(n, a1, a2, a3)
+  if n == 1 then return a1
+  elseif n == 2 then return a1, a2
+  elseif n == 3 then return a1, a2, a3
+  elseif n == 0 then return end
+  return unpack(a1, 1, a1.n)
+end
+
+local function popret(st, d, ...)
+  st[d] = nil
+  st.n = d - 1
+  return ...
+end
+
+-- Ends the call of the frame at depth d with the signal of its body.
+local function leave(st, d, sig, val)
+  if sig == RETURN1 then
+    st[d] = nil
+    st.n = d - 1
+    return val
+  elseif sig == TAILCALL then
+    local n, desc, a1, a2, a3 = TN, TD, T1, T2, T3
+    T1, T2, T3, TD = nil, nil, nil, nil
+    if FUPS[val] == nil then
       -- a native is not a real tail call: call it while this frame is still there
       -- (argument errors then see the right call site)
-      local r = pack(callx(val[3], val[1], unpack(val[2], 1, val[2].n)))
-      st[d] = nil
-      st.n = d - 1
-      return unpack(r, 1, r.n)
+      return popret(st, d, callx(desc, val, tailargs(n, a1, a2, a3)))
     end
     st[d] = nil
     st.n = d - 1
-    if sig == RETURN then return unpack(val, 1, val.n) end
-    if sig == TAILCALL then
-      local fv, args, desc = val[1], val[2], val[3]
-      return callx(desc, fv, unpack(args, 1, args.n))
-    end
-    return
+    return val(tailargs(n, a1, a2, a3))
   end
+  st[d] = nil
+  st.n = d - 1
+  if sig == RETURN then return unpack(val, 1, val.n) end
+end
+
+-- Pushes the new frame A and runs the body. caps lists captured parameters.
+local function enter(A, run, caps)
+  if caps then
+    for i = 1, #caps do
+      local s = caps[i]
+      A[s] = { v = A[s] }
+    end
+  end
+  local st = R.stack
+  local d = st.n + 1
+  if d > MAXDEPTH then rterror("stack overflow") end
+  st[d] = A
+  st.n = d
+  return leave(st, d, run(A))
+end
+
+-- Creates a Lua function value from a compiled proto and its upvalue cells.
+-- Functions with up to 3 parameters bind them directly as the first array
+-- items of the frame; the frame fields are created with the frame.
+function C.newlua(c, ups)
+  ups.c = c
+  local run, line, caps, np, isvararg = c.run, c.line, c.caps, c.np, c.isvararg
+  local fn
+  if c.varslot or np > 3 then
+    local varslot, varcap = c.varslot, c.varcap
+    fn = function(...)
+      local nargs = select("#", ...)
+      local A = { ... }
+      for i = np + 1, nargs do A[i] = nil end   -- only the parameters are locals
+      A.up, A.line, A.cdesc, A.nargs = ups, line, false, 0
+      if isvararg then
+        A.va = (nargs > np) and pack(select(np + 1, ...)) or EMPTYVA
+      end
+      if varslot then
+        -- named vararg: a Lua table with the extra arguments and field n
+        local t = R.newtable()
+        local va = A.va
+        for j = 1, va.n do t.hash[j] = va[j] end
+        t.hash.n = va.n
+        if varcap then A[varslot] = { v = t } else A[varslot] = t end
+      end
+      return enter(A, run, caps)
+    end
+  elseif not isvararg then
+    if np == 0 then
+      fn = function()
+        return enter({ up = ups, line = line, cdesc = false, nargs = 0 }, run, caps)
+      end
+    elseif np == 1 then
+      fn = function(a1)
+        return enter({ a1, up = ups, line = line, cdesc = false, nargs = 0 }, run, caps)
+      end
+    elseif np == 2 then
+      fn = function(a1, a2)
+        return enter({ a1, a2, up = ups, line = line, cdesc = false, nargs = 0 }, run, caps)
+      end
+    else
+      fn = function(a1, a2, a3)
+        return enter({ a1, a2, a3, up = ups, line = line, cdesc = false, nargs = 0 }, run, caps)
+      end
+    end
+  else
+    if np == 0 then
+      fn = function(...)
+        local va = (select("#", ...) > 0) and pack(...) or EMPTYVA
+        return enter({ up = ups, line = line, cdesc = false, nargs = 0, va = va }, run, caps)
+      end
+    elseif np == 1 then
+      fn = function(a1, ...)
+        local va = (select("#", ...) > 0) and pack(...) or EMPTYVA
+        return enter({ a1, up = ups, line = line, cdesc = false, nargs = 0, va = va }, run, caps)
+      end
+    elseif np == 2 then
+      fn = function(a1, a2, ...)
+        local va = (select("#", ...) > 0) and pack(...) or EMPTYVA
+        return enter({ a1, a2, up = ups, line = line, cdesc = false, nargs = 0, va = va }, run, caps)
+      end
+    else
+      fn = function(a1, a2, a3, ...)
+        local va = (select("#", ...) > 0) and pack(...) or EMPTYVA
+        return enter({ a1, a2, a3, up = ups, line = line, cdesc = false, nargs = 0, va = va },
+                     run, caps)
+      end
+    end
+  end
+  ups.fn = fn
   FUPS[fn] = ups
   return fn
 end

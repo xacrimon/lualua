@@ -8,6 +8,7 @@ Categories (excluded features, stubbed rather than implemented):
   dump     string.dump and binary chunks
   pointer  pointer / address identity (%p, string internalization)
   memory   collectgarbage("count") memory measurements
+  platform features of the host system that are missing (e.g. /dev/full on macOS)
 
 Stubs are located by unique text fragments, not line numbers. A stub either
 turns the first assert( on a line into _stub( (the argument is still evaluated),
@@ -16,7 +17,11 @@ or comments out a block of lines.
 import glob, os, shutil, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.environ.get("LUA_TESTES", "/home/acrimon/work/lua/testes")
+# default: a checkout of the reference implementation next to the tcvm repository
+SRC = os.environ.get("LUA_TESTES",
+                     os.path.normpath(os.path.join(HERE, "..", "..", "..", "..", "lua", "testes")))
+if not os.path.isdir(SRC):
+    sys.exit(f"official test suite not found at {SRC}; set LUA_TESTES")
 OUT = os.path.join(HERE, "adapted")
 DST = os.path.join(OUT, "testes")
 LOG = os.path.join(OUT, "STUBLOG.txt")
@@ -221,6 +226,11 @@ def main():
     stub("gc.lua", 'collectgarbage("count") <= m + 1', "memory", "everything collected (memory count)")
 
     stub_db()
+
+    # host platform
+    if not os.path.exists("/dev/full"):
+        block("files.lua", 'io.output("/dev/full")', "assert(not io.flush())    -- cannot write to device",
+              "platform", "no /dev/full on this system", plus=1)
 
     # debug library
     stub("closure.lua", "debug.upvalueid(string.gmatch", "debug", "upvalueid of a C closure")
