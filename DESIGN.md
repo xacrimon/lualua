@@ -124,6 +124,10 @@ tests/where.sh      report the first failing assertion location per file
 
 ## Status against the official suite
 
+`tests/run_testes.sh` (default: every file except all.lua and heavy.lua):
+17 of 32 files pass. Run `tests/run_testes.sh` for the current list, and
+`tests/where.sh <file>` to locate the first failing assertion.
+
 See `git log` for the milestones. Known gaps (not implemented or deviating):
 
 - Closing a suspended coroutine does not run its pending `__close` handlers.
@@ -132,7 +136,9 @@ See `git log` for the milestones. Known gaps (not implemented or deviating):
 - `%p` / interned-string identity is not modelled.
 - `table.create` does not reserve memory; `collectgarbage("count")` is host-based.
 - C-stack overflow in nested `pcall` is not reproduced exactly.
-- `require` search-failure messages list only the Lua path templates.
+- `string.dump` and binary chunks are not supported (text chunks only).
+- `debug.getinfo(f, 'L')` does not return `activelines`; light userdata is not modelled.
+- Argument errors cannot distinguish a missing argument from nil in every library.
 
 ## Lua 5.5 specifics to keep in mind
 
