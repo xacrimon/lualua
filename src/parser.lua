@@ -168,12 +168,14 @@ local function findupval(f, name)
   local vi = findlocal(p, name)
   if vi == "global" then return nil end
   if vi then
+    if #f.upvals >= 255 then errorat("too many upvalues (limit is 255) in function at line " .. f.line, ls.tl) end
     vi.captured = true
     f.upvals[#f.upvals + 1] = { name = name, instack = true, slot = vi.slot, var = vi }
     return #f.upvals
   end
   local idx = findupval(p, name)
   if idx then
+    if #f.upvals >= 255 then errorat("too many upvalues (limit is 255) in function at line " .. f.line, ls.tl) end
     f.upvals[#f.upvals + 1] = { name = name, instack = false, idx = idx }
     return #f.upvals
   end
@@ -223,7 +225,7 @@ end
 -- Expressions
 ---------------------------------------------------------------------------
 
-local expr, statlist, block_follow, funcbody, tablecons
+local expr, statlist, block_follow, funcbody, tablecons, subexpr_body
 
 local BINPRI = {
   ["or"] = { 1, 1 }, ["and"] = { 2, 2 },
@@ -274,6 +276,8 @@ local function callargs()
     local args = {}
     if ls.t ~= ")" then args = explist() end
     checkmatch(")", "(", line)
+    -- the arguments need registers (the C compiler's limit is about 250)
+    if #args > 250 then errorat("function or expression needs too many registers", line) end
     return args, line
   end
   syntaxerror("function arguments expected")
@@ -342,11 +346,11 @@ local function simpleexp()
   if t == "number" then
     local v = ls.v
     ls:advance()
-    return { k = "num", v = v }
+    return { k = "num", v = v, line = line }
   elseif t == "string" then
     local v = ls.v
     ls:advance()
-    return { k = "str", v = v }
+    return { k = "str", v = v, line = line }
   elseif t == "nil" then ls:advance() return { k = "nil" }
   elseif t == "true" then ls:advance() return { k = "true" }
   elseif t == "false" then ls:advance() return { k = "false" }
@@ -366,7 +370,19 @@ local function simpleexp()
   return suffixedexp()
 end
 
+-- Nesting of expressions (and statements) is limited, as in the C parser.
+local MAXLEVELS = 200
+local nesting = 0
+
 local function subexpr(limit)
+  nesting = nesting + 1
+  if nesting > MAXLEVELS then errorat("C stack overflow", ls.tl) end
+  local e = subexpr_body(limit)
+  nesting = nesting - 1
+  return e
+end
+
+subexpr_body = function(limit)
   local e
   local t = ls.t
   if t == "not" or t == "-" or t == "#" or t == "~" then
@@ -411,10 +427,13 @@ end
 
 -- Parses statements until a block-follow token; returns the block node.
 local function block(isloop)
+  nesting = nesting + 1
+  if nesting > MAXLEVELS then errorat("C stack overflow", ls.tl) end
   local b = openblock(isloop)
   local stats = statlist()
   b.stats = stats
   closeblock(b)
+  nesting = nesting - 1
   return { k = "block", stats = stats, labels = b.labels }
 end
 
@@ -436,18 +455,25 @@ local function localnames()
   local closecount = 0
   local prefix = attrib()   -- attribute before the list applies to all names
   repeat
+    local nline = ls.tl
     local name = checkname()
     local at = attrib() or prefix
     if at == "close" then
       closecount = closecount + 1
-      if closecount > 1 then syntaxerror("multiple to-be-closed variables in local list") end
+      if closecount > 1 then errorat("multiple to-be-closed variables in local list", nline) end
     end
     names[#names + 1] = { name = name, attrib = at }
   until not testnext(",")
   return names
 end
 
+local MAXVARS = 200   -- active local variables per function (as in lparser.c)
+
 local function activate(vi)
+  if #fs.actvars >= MAXVARS then
+    local where = fs.line and ("function at line " .. fs.line) or "main function"
+    errorat("too many local variables (limit is " .. MAXVARS .. ") in " .. where, ls.tl)
+  end
   fs.actvars[#fs.actvars + 1] = vi
 end
 
@@ -558,6 +584,8 @@ local function exprstat(line)
     local targets = { e }
     while testnext(",") do
       targets[#targets + 1] = suffixedexp()
+      -- every target needs a register while the values are computed
+      if #targets > MAXVARS then errorat("function or expression needs too many registers", line) end
     end
     checknext("=")
     local exprs = explist()
@@ -813,12 +841,15 @@ end
 
 -- Parses '(' params ')' and the body; `name` is for error messages only.
 funcbody = function(ismethod, line, name)
+  nesting = nesting + 1
+  if nesting > MAXLEVELS then errorat("C stack overflow", ls.tl) end
   local params = {}
   local isvararg = false
   local varvar = nil
   -- new function state
   local outer = fs
   local newf = newfs(outer, false)
+  newf.line = line
   fs = newf
   local savedgd = #gdecls
   local b = openblock(false)
@@ -860,6 +891,7 @@ funcbody = function(ismethod, line, name)
   closeblock(b)
   while #gdecls > savedgd do gdecls[#gdecls] = nil end
   fs = outer
+  nesting = nesting - 1
   return {
     name = name or "anonymous",
     params = params,
@@ -880,6 +912,7 @@ end
 -- Parses a chunk. Returns the main function proto (vararg, upvalue 1 = _ENV).
 -- chunkname is the already-formatted short source used in messages.
 function M.parse(src, chunkname)
+  nesting = 0   -- a previous parse may have failed inside nested constructs
   ls = lexer.new(src, chunkname)
   gdecls = { { all = true, names = {}, implicit = true, attrib = nil } }
   local mainf = newfs(nil, true)

@@ -110,9 +110,12 @@ E.index = function(node)
   local o = cexpr(node.obj)
   local key = cexpr(node.key)
   local d = describe(node.obj)
+  local line = node.line
   return function(A)
     local ob = o(A)
-    return index(ob, key(A), d)
+    local k = key(A)
+    A.line = line
+    return index(ob, k, d)
   end
 end
 
@@ -162,6 +165,7 @@ E.unop = function(node)
   local op = node.op
   local a = cexpr(node.a)
   local d = describe(node.a)
+  local line = node.line
   if op == "not" then
     return function(A)
       local x = a(A)
@@ -171,17 +175,21 @@ E.unop = function(node)
     return function(A)
       local x = a(A)
       if type(x) == "number" then return -x end
+      A.line = line
       return unm(x, d)
     end
   elseif op == "#" then
     return function(A)
       local x = a(A)
       if type(x) == "string" then return #x end
+      A.line = line
       return len(x, d)
     end
   elseif op == "~" then
     return function(A)
-      return bnot(a(A), d)
+      local x = a(A)
+      A.line = line
+      return bnot(x, d)
     end
   end
   error("unknown unary operator " .. op)
@@ -197,71 +205,72 @@ E.binop = function(node)
   local op = node.op
   local a, b = cexpr(node.a), cexpr(node.b)
   local da, db = describe(node.a), describe(node.b)
+  local line = node.line   -- errors of this operation report the operator's line
   if op == "+" then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "number" and type(y) == "number" then return x + y end
-      return add(x, y, da, db)
+      A.line = line; return add(x, y, da, db)
     end
   elseif op == "-" then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "number" and type(y) == "number" then return x - y end
-      return sub(x, y, da, db)
+      A.line = line; return sub(x, y, da, db)
     end
   elseif op == "*" then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "number" and type(y) == "number" then return x * y end
-      return mul(x, y, da, db)
+      A.line = line; return mul(x, y, da, db)
     end
   elseif op == "==" then
     return function(A)
       local x = a(A)
-      return eq(x, b(A))
+      local y = b(A); A.line = line; return eq(x, y)
     end
   elseif op == "~=" then
     return function(A)
       local x = a(A)
-      return not eq(x, b(A))
+      local y = b(A); A.line = line; return not eq(x, y)
     end
   elseif op == "<" then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "number" and type(y) == "number" then return x < y end
-      return lt(x, y)
+      A.line = line; return lt(x, y)
     end
   elseif op == "<=" then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "number" and type(y) == "number" then return x <= y end
-      return le(x, y)
+      A.line = line; return le(x, y)
     end
   elseif op == ">" then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "number" and type(y) == "number" then return x > y end
-      return lt(y, x)
+      A.line = line; return lt(y, x)
     end
   elseif op == ">=" then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "number" and type(y) == "number" then return x >= y end
-      return le(y, x)
+      A.line = line; return le(y, x)
     end
   elseif op == ".." then
     return function(A)
       local x = a(A)
       local y = b(A)
       if type(x) == "string" and type(y) == "string" then return x .. y end
-      return concat(x, y, da, db)
+      A.line = line; return concat(x, y, da, db)
     end
   end
   local f = ARITH_SLOW[op]
@@ -269,7 +278,7 @@ E.binop = function(node)
   return function(A)
     local x = a(A)
     local y = b(A)
-    return f(x, y, da, db)
+    A.line = line; return f(x, y, da, db)
   end
 end
 
@@ -709,8 +718,11 @@ S.genfor = function(node)
   local nv = #vars
   local body = cblock(node.body)
   local iterdesc = "for iterator 'for iterator'"
+  -- errors in the iterator call report the line where the explist starts
+  local iterline = (node.exprs[1] and node.exprs[1].line) or node.line
   local function runloop(A, f, st, ctrl)
     while true do
+      A.line = iterline
       local rs = pack(callx(iterdesc, f, st, ctrl))
       local v1 = rs[1]
       if v1 == nil then break end

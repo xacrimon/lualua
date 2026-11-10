@@ -161,7 +161,10 @@ function Lexer:scan()
   end
 
   self.pos = pos + 1
-  self:error("unexpected symbol", one)
+  -- non-printable characters are shown as <\N> (decimal code), as in llex.c
+  local b = sbyte(one)
+  local shown = (b and (b < 32 or b > 126)) and ("<\\" .. b .. ">") or one
+  self:error("unexpected symbol", shown)
 end
 
 -- If the bracket at pos (pointing at '[' or '=') opens a long bracket,

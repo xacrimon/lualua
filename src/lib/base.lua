@@ -147,8 +147,14 @@ return function(G)
     if v ~= nil and v ~= false then return ... end
     if n < 2 then
       -- LUALUA_DEBUG=1 reports where an assertion failed (debugging aid)
-      if os.getenv("LUALUA_DEBUG") then io.stderr:write("assertion failed at ", R.where(1), "\n") end
-      R.throw("assertion failed!")
+      if os.getenv("LUALUA_DEBUG") then
+        io.stderr:write("assertion failed at ", R.where(1), "\n")
+        local st = R.stack
+        for i = st.n, math.max(1, st.n - 6), -1 do
+          io.stderr:write("   frame ", i, " ", tostring(st[i] and st[i].src), ":", tostring(st[i] and st[i].line), "\n")
+        end
+      end
+      R.rterror("assertion failed!")   -- luaL_error: with the caller's position
     end
     R.throw((select(2, ...)))
   end
@@ -180,6 +186,18 @@ return function(G)
     return unpack(r, 1, r.n)
   end
 
+  -- Runs the message handler. An error inside the handler is handled by the
+  -- handler again (as Lua does); after too many nested errors the C stack is "full".
+  local MAXHANDLER = 200
+  local function runhandler(handler, err, n, depth)
+    local st = R.stack
+    st.n = n
+    local hr = pack(pcall(R.call, handler, err))
+    if hr[1] then return hr[2] end
+    if depth >= MAXHANDLER then return "C stack overflow" end
+    return runhandler(handler, hr[2], n, depth + 1)
+  end
+
   local function xpcall_(f, handler, ...)
     local st = R.stack
     local n = st.n
@@ -191,13 +209,9 @@ return function(G)
     if r[1] then return unpack(r, 1, r.n) end
     if r[2] == R.CLOSING then error(R.CLOSING, 0) end   -- not catchable here
     st.n = n
-    local hr = pack(pcall(R.call, handler, r[2]))
-    st.n = n
-    if not hr[1] then
-      -- an error inside the message handler
-      return false, "error in error handling"
-    end
-    return false, hr[2]
+    local msg = runhandler(handler, r[2], n, 1)
+    st.n = n   -- the handler's frames are gone
+    return false, msg
   end
 
   -- error for a chunk whose kind (binary or text) is not allowed by mode
