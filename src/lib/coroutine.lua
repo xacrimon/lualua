@@ -73,6 +73,8 @@ return function(G)
     end
   end
 
+  local mainthread = corunning()
+
   local function close(co)
     checkco(co, 1, "close")
     local st = costatus(co)
@@ -81,6 +83,7 @@ return function(G)
       if not ok then return false, err end
       return true
     end
+    if st == "running" and co == mainthread then R.rterror("cannot close main thread") end
     R.rterror("cannot close a " .. st .. " coroutine")
   end
 

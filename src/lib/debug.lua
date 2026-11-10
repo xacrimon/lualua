@@ -38,6 +38,10 @@ return function(G)
   local function getinfo(a, opts)
     local t = R.newtable()
     local st = R.stack
+    if opts ~= nil then
+      opts = R.checkstring(opts, 2, "getinfo")
+      if opts:find("[^SlnrutfL]") then R.argerror(2, "getinfo", "invalid option") end
+    end
     if type(a) == "number" then
       if a < 0 or a > st.n then return nil end
       if a == 0 then return nil end

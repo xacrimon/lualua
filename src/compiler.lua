@@ -725,7 +725,7 @@ S.genfor = function(node)
     if h == nil then rterror("variable '(for state)' got a non-closable value") end
     local ok, sig, val = pcall(runloop, A, vals[1], vals[2], vals[3])
     if ok then
-      R.call(h, closing, nil)
+      R.call(h, closing)
       return sig, val
     end
     R.stack.n = A.depth
@@ -817,7 +817,10 @@ local function closeall(list, err)
     local v = list[i]
     local h = R.metamethod(v, "__close")
     if h ~= nil then
-      local ok, e2 = pcall(R.call, h, v, err)
+      -- like Lua, the error object is passed only when closing because of an error
+      local ok, e2
+      if err == nil then ok, e2 = pcall(R.call, h, v)
+      else ok, e2 = pcall(R.call, h, v, err) end
       if not ok then err = e2 end
     end
   end
