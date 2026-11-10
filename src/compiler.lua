@@ -31,7 +31,7 @@ local unm, bnot, band, bor, bxor, shl, shr = R.unm, R.bnot, R.band, R.bor, R.bxo
 local truthy = R.truthy
 local rawset = R.rawset
 
-local MAXDEPTH = 195000
+local MAXDEPTH = 50000   -- Lua-to-Lua call depth limit (reached sooner than the reference; see DESIGN.md)
 -- closure -> its upvalue cells; the cell array also carries .names (upvalue names)
 local FUPS = setmetatable({}, { __mode = "k" })
 C.FUPS = FUPS

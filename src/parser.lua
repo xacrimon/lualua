@@ -470,7 +470,11 @@ end
 local MAXVARS = 200   -- active local variables per function (as in lparser.c)
 
 local function activate(vi)
-  if #fs.actvars >= MAXVARS then
+  local nvars = 0   -- active variables (global declaration entries do not count)
+  for _, v in ipairs(fs.actvars) do
+    if not v.pseudo then nvars = nvars + 1 end
+  end
+  if nvars >= MAXVARS then
     local where = fs.line and ("function at line " .. fs.line) or "main function"
     errorat("too many local variables (limit is " .. MAXVARS .. ") in " .. where, ls.tl)
   end
@@ -493,7 +497,8 @@ end
 -- Declared global names are scope entries like locals (for goto checks), so
 -- each gets a pseudo entry; '*' names the collective declaration.
 local function pseudoscope(name)
-  activate({ name = name, attrib = nil, slot = 0, captured = false, pseudo = true })
+  -- not a variable: no local-variable limit applies
+  fs.actvars[#fs.actvars + 1] = { name = name, attrib = nil, slot = 0, captured = false, pseudo = true }
 end
 
 local function globalstat(line)

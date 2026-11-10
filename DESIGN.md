@@ -124,29 +124,38 @@ tests/where.sh      report the first failing assertion location per file
 
 ## Status against the official suite
 
-`tests/run_testes.sh` (default: every file except all.lua and heavy.lua):
-17 of 32 files pass. Run `tests/run_testes.sh` for the current list, and
-`tests/where.sh <file>` to locate the first failing assertion.
+Test workflow:
+- `tests/make_adapted.sh` regenerates `tests/adapted/testes` from the official
+  suite (`/home/acrimon/work/lua/testes`) and applies the exclusion stubs; the
+  log is `tests/adapted/STUBLOG.txt`. The official directory is never modified.
+- `tests/run_testes.sh` runs the adapted suite (default); `tests/where.sh <file>`
+  reports the first failing assertion.
+- Excluded (stubbed, tagged `STUB[category]`): `debug` (debug library; the file
+  `db.lua` is excluded whole), `dump` (`string.dump` and binary chunks),
+  `pointer` (address identity, string interning), `memory`
+  (`collectgarbage("count")` measurements).
 
-See `git log` for the milestones. Known gaps (not implemented or deviating):
-
-- Closing a suspended coroutine does not run its pending `__close` handlers.
-- `global *` (goto scope check against `global` declarations) is not checked.
-- Argument errors say `got nil`, not `got no value`.
-- `%p` / interned-string identity is not modelled.
-- `table.create` does not reserve memory; `collectgarbage("count")` is host-based.
-- C-stack overflow in nested `pcall` is not reproduced exactly.
-- `string.dump` and binary chunks are not supported (text chunks only).
-- `debug.getinfo(f, 'L')` does not return `activelines`; light userdata is not modelled.
-- Argument errors cannot distinguish a missing argument from nil in every library.
+Known gaps that remain (not excluded):
+- Argument errors: a missing argument is "no value" only when the caller's
+  argument count is known (Lua calls and natives called by `pcall`/`ccall`).
+- Call-site naming is approximated: `method` vs `field` uses a per-function
+  constant index (more than 255 constants gives `field`).
+- Deep recursion to the frame limit is slow (about a minute for
+  `cstack.lua`): frames are heavier than the reference's.
+- `coroutine.isyieldable` and yields across library callbacks model only
+  `gsub` and `table.sort`.
 
 ## Lua 5.5 specifics to keep in mind
 
-- `global` is a reserved word. `global [<const>] name, ...`, `global [<const>] *`,
+- `global` is a contextual keyword: it starts a declaration only before a name, `*`,
+  `<` or `function` (otherwise it is an ordinary name, as with LUA_COMPAT_GLOBAL). `global [<const>] name, ...`, `global [<const>] *`,
   `global function f`. Name resolution rules are syntactic: inside a `global`
   declaration scope only declared names may be used; `global<const> *` makes
   implicit globals read-only.
 - Control variable of numeric `for` is read-only (assignment is a compile error).
 - `__call` chains: at most 15 objects.
 - An error object of `nil` is replaced by a string message.
+- Finalizers (`__gc`) run through host finalizers (tables and userdata whose
+  metatable has `__gc` when set get a finalizable host metatable); closing the
+  state at exit runs the pending ones.
 - `collectgarbage` options changed (`"param"` option replaces `incremental`/`generational` parameter setters).
