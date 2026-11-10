@@ -563,6 +563,7 @@ end
 -- Returns the integer limit, or nil when the loop must be skipped.
 local function forlimit(limit, step)
   if mtype(limit) == "integer" then return limit end
+  if type(limit) == "string" then limit = tonumber(limit) end
   if type(limit) ~= "number" then rterror("'for' limit must be a number") end
   if limit ~= limit then return nil end
   local f = (step < 0) and math.ceil(limit) or math.floor(limit)
@@ -590,7 +591,9 @@ local function udiv(n, d)
   return q
 end
 
+-- numeric for-loop operands: numbers, or strings convertible to numbers
 local function forcheck(v, what)
+  if type(v) == "string" then v = tonumber(v) end
   if type(v) ~= "number" then rterror("'for' " .. what .. " must be a number") end
   return v
 end
@@ -641,10 +644,9 @@ S.numfor = function(node)
       return
     end
     -- float loop
-    forcheck(limit, "limit")
-    forcheck(step, "step")
-    forcheck(init, "initial value")
-    local fl, fs, fi = limit + 0.0, step + 0.0, init + 0.0
+    local fl = forcheck(limit, "limit") + 0.0
+    local fs = forcheck(step, "step") + 0.0
+    local fi = forcheck(init, "initial value") + 0.0
     if fs == 0 then rterror("'for' step is zero") end
     local i = fi
     while (fs > 0 and i <= fl) or (fs < 0 and i >= fl) do
@@ -665,9 +667,7 @@ S.genfor = function(node)
   local nv = #vars
   local body = cblock(node.body)
   local iterdesc = "for iterator 'for iterator'"
-  return function(A)
-    local vals = pack(explist(A))
-    local f, st, ctrl = vals[1], vals[2], vals[3]
+  local function runloop(A, f, st, ctrl)
     while true do
       local rs = pack(callx(iterdesc, f, st, ctrl))
       local v1 = rs[1]
@@ -683,6 +683,24 @@ S.genfor = function(node)
         return sig, val
       end
     end
+  end
+  return function(A)
+    local vals = pack(explist(A))
+    local closing = vals[4]
+    if closing == nil or closing == false then
+      return runloop(A, vals[1], vals[2], vals[3])
+    end
+    -- the fourth value is a to-be-closed variable closed when the loop ends
+    local h = R.metamethod(closing, "__close")
+    if h == nil then rterror("variable '(for state)' got a non-closable value") end
+    local ok, sig, val = pcall(runloop, A, vals[1], vals[2], vals[3])
+    if ok then
+      R.call(h, closing, nil)
+      return sig, val
+    end
+    R.stack.n = A.depth
+    pcall(R.call, h, closing, sig)
+    error(sig, 0)
   end
 end
 
@@ -860,6 +878,10 @@ compile_proto = function(proto)
     isvararg = proto.isvararg,
     udesc = proto.upvals,
   }
+  if proto.varvar then
+    c.varslot = proto.varvar.slot
+    c.varcap = proto.varvar.captured
+  end
   proto.compiled = c
   c.run = cblock(proto.body)
   return c
@@ -869,6 +891,7 @@ end
 function C.newlua(c, ups)
   local run, params, np, isvararg = c.run, c.params, c.np, c.isvararg
   local src, line = c.src, c.line
+  local varslot, varcap = c.varslot, c.varcap
   return function(...)
     local A = { up = ups, src = src, line = line }
     if np > 0 then
@@ -886,6 +909,14 @@ function C.newlua(c, ups)
       else
         A.va = { n = 0 }
       end
+    end
+    if varslot then
+      -- named vararg: a Lua table with the extra arguments and field n
+      local t = R.newtable()
+      local va = A.va
+      for j = 1, va.n do t.hash[j] = va[j] end
+      t.hash.n = va.n
+      if varcap then A[varslot] = { v = t } else A[varslot] = t end
     end
     local st = R.stack
     local d = st.n + 1

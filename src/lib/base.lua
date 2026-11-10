@@ -60,23 +60,23 @@ return function(G)
     return R.next(t, k)
   end
 
+  -- one shared iterator, so that ipairs(a) == ipairs(b) for the iterator
+  local function ipairs_iter(tt, i)
+    i = i + 1
+    local v = R.index(tt, i)
+    if v == nil then return nil end
+    return i, v
+  end
+
   local function ipairs_(...)
     if select("#", ...) == 0 then R.argerror(1, "ipairs", "table expected, got no value") end
-    local t = ...
-    local function iter(tt, i)
-      i = i + 1
-      local v = R.index(tt, i)
-      if v == nil then return nil end
-      return i, v
-    end
-    return iter, t, 0
+    return ipairs_iter, (...), 0
   end
 
   local function pairs_(t)
     local h = R.metamethod(t, "__pairs")
     if h ~= nil then
-      local a, b, c = R.call(h, t)
-      return a, b, c
+      return R.call(h, t)
     end
     R.checktable(t, 1, "pairs")
     return next_, t, nil
@@ -142,7 +142,11 @@ return function(G)
     if n == 0 then R.argerror(1, "assert", "value expected") end
     local v = ...
     if v ~= nil and v ~= false then return ... end
-    if n < 2 then R.throw("assertion failed!") end
+    if n < 2 then
+      -- LUALUA_DEBUG=1 reports where an assertion failed (debugging aid)
+      if os.getenv("LUALUA_DEBUG") then io.stderr:write("assertion failed at ", R.where(1), "\n") end
+      R.throw("assertion failed!")
+    end
     R.throw((select(2, ...)))
   end
 
@@ -179,7 +183,7 @@ return function(G)
     return false, hr[2]
   end
 
-  local function load_(chunk, chunkname, mode, env)
+  local function load_(chunk, chunkname, mode, ...)
     local src
     if type(chunk) == "string" then
       src = chunk
@@ -203,7 +207,7 @@ return function(G)
       R.checkstring(mode, 3, "load")
     end
     local e = G
-    if select("#", chunk, chunkname, mode, env) >= 4 then e = env end
+    if select("#", ...) >= 1 then e = (...) end   -- explicit env argument (even nil)
     local f, err = loader.load(src, chunkname or src, e)
     if not f then return nil, err end
     return f
@@ -217,7 +221,7 @@ return function(G)
     return s
   end
 
-  local function loadfile_(path, mode, env)
+  local function loadfile_(path, mode, ...)
     local src, err
     if path == nil then
       src = io.read("a")
@@ -231,7 +235,7 @@ return function(G)
       src = "--" .. src
     end
     local e = G
-    if select("#", path, mode, env) >= 3 then e = env end
+    if select("#", ...) >= 1 then e = (...) end
     local f, lerr = loader.load(src, path, e)
     if not f then return nil, lerr end
     return f

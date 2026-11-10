@@ -400,9 +400,10 @@ end
 local function localnames()
   local names = {}
   local closecount = 0
+  local prefix = attrib()   -- attribute before the list applies to all names
   repeat
     local name = checkname()
-    local at = attrib()
+    local at = attrib() or prefix
     if at == "close" then
       closecount = closecount + 1
       if closecount > 1 then syntaxerror("multiple to-be-closed variables in local list") end
@@ -707,6 +708,7 @@ end
 funcbody = function(ismethod, line, name)
   local params = {}
   local isvararg = false
+  local varvar = nil
   -- new function state
   local outer = fs
   local newf = newfs(outer, false)
@@ -729,6 +731,12 @@ funcbody = function(ismethod, line, name)
       elseif ls.t == "..." then
         ls:advance()
         isvararg = true
+        -- Lua 5.5 named vararg: '...name' binds a table with the extra arguments
+        if ls.t == "name" then
+          varvar = newvarinfo(ls.v, nil)
+          ls:advance()
+          activate(varvar)
+        end
         break
       else
         syntaxerror("<name> expected")
@@ -748,6 +756,7 @@ funcbody = function(ismethod, line, name)
     name = name or "anonymous",
     params = params,
     isvararg = isvararg,
+    varvar = varvar,
     body = { k = "block", stats = stats, labels = b.labels },
     nslots = newf.nslots,
     upvals = newf.upvals,
