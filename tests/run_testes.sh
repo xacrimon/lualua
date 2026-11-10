@@ -3,7 +3,7 @@
 # usage: tests/run_testes.sh [file.lua ...]   (default: all files in testes)
 # TESTES env var overrides the suite location.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-TESTES=${TESTES:-/home/acrimon/work/lua/testes}
+TESTES=${TESTES:-$ROOT/tests/adapted/testes}
 files="$*"
 [ -z "$files" ] && files=$(cd "$TESTES" && ls *.lua | grep -v -e "^all.lua$" -e "^heavy.lua$")
 pass=0; fail=0
