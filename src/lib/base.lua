@@ -2,6 +2,7 @@
 
 local R = require("runtime")
 local loader = require("loader")
+local FUPS = require("compiler").FUPS   -- closures created from Lua code
 
 local type, select, tostring, tonumber = type, select, tostring, tonumber
 local pack, unpack = table.pack, table.unpack
@@ -163,10 +164,12 @@ return function(G)
 
   -- Runs f(...) in protected mode, restoring the frame stack on error.
   local function pcall_(f, ...)
-    if select("#", ...) == -1 then end
     local st = R.stack
     local n = st.n
+    local savednat = st.nat
+    if FUPS[f] == nil then st.nat = n end   -- a native called directly by pcall
     local r = pack(pcall(R.call, f, ...))
+    st.nat = savednat
     if not r[1] then
       st.n = n
     end
@@ -176,7 +179,10 @@ return function(G)
   local function xpcall_(f, handler, ...)
     local st = R.stack
     local n = st.n
+    local savednat = st.nat
+    if FUPS[f] == nil then st.nat = n end
     local r = pack(pcall(R.call, f, ...))
+    st.nat = savednat
     if r[1] then return unpack(r, 1, r.n) end
     st.n = n
     local hr = pack(pcall(R.call, handler, r[2]))
@@ -343,7 +349,11 @@ return function(G)
       if type(path) ~= "string" then R.rterror("'package.path' must be a string") end
       local file, tried = searchpath(name, path)
       if not file then
-        R.rterror("module '" .. name .. "' not found:\n\tno field package.preload['" .. name .. "']" .. tried)
+        -- C modules are not loadable here, but the message lists their search too
+        local cpath = package.hash.cpath
+        local _, ctried = searchpath(name, type(cpath) == "string" and cpath or "")
+        R.rterror("module '" .. name .. "' not found:\n\tno field package.preload['" .. name .. "']"
+                  .. tried .. (ctried or ""))
       end
       local src = readfile(file)
       local f, err = loader.load(src, "@" .. file, G)

@@ -44,6 +44,9 @@ R.stack = { n = 0 }
 -- (level 1 = innermost Lua function). Empty string if there is no such frame.
 local function where(level)
   local st = R.stack
+  -- a native called directly by another native (e.g. pcall(error, msg)) has
+  -- no Lua caller, so it gets no position: st.nat is the depth of such a call
+  if level == 1 and st.nat == st.n then return "" end
   local i = st.n - level + 1
   local f = i >= 1 and st[i]
   if f then return f.src .. ":" .. f.line .. ": " end
@@ -96,6 +99,17 @@ local function getmt(v)
   return R.typemt[t]
 end
 R.getmt = getmt
+
+-- Type name for error messages: the __name metafield if it is a string.
+local function objtypename(v)
+  local mt = getmt(v)
+  if mt ~= nil then
+    local name = mt.hash.__name
+    if type(name) == "string" then return name end
+  end
+  return ltype(v)
+end
+R.objtypename = objtypename
 
 -- Raw metamethod lookup: the value of field `ev` in the metatable, or nil.
 local function metamethod(v, ev)
@@ -193,7 +207,7 @@ local function callchain(desc, f, n, ...)
   if type(f) == "function" then return f(...) end
   local h = metamethod(f, "__call")
   if h == nil then
-    rterror("attempt to call a " .. ltype(f) .. " value" .. (desc and (" (" .. desc .. ")") or ""))
+    rterror("attempt to call a " .. objtypename(f) .. " value" .. (desc and (" (" .. desc .. ")") or ""))
   end
   if n >= 15 then rterror("'__call' chain too long; possibly a loop") end
   return callchain(nil, h, n + 1, f, ...)
@@ -235,11 +249,11 @@ local function index(o, k, desc)
     else
       local mt = getmt(o)
       if mt == nil then
-        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+        rterror("attempt to index a " .. objtypename(o) .. " value" .. varinfo(desc))
       end
       h = mt.hash.__index
       if h == nil then
-        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+        rterror("attempt to index a " .. objtypename(o) .. " value" .. varinfo(desc))
       end
     end
     if type(h) == "function" then return (h(o, k)) end
@@ -269,11 +283,11 @@ local function setindex(o, k, v, desc)
     else
       local mt = getmt(o)
       if mt == nil then
-        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+        rterror("attempt to index a " .. objtypename(o) .. " value" .. varinfo(desc))
       end
       h = mt.hash.__newindex
       if h == nil then
-        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+        rterror("attempt to index a " .. objtypename(o) .. " value" .. varinfo(desc))
       end
     end
     if type(h) == "function" then
@@ -322,18 +336,23 @@ end
 -- Arithmetic
 ---------------------------------------------------------------------------
 
+-- Calls metamethod h for event ev; errors name it as "metamethod 'add'".
+local function mmcall(ev, h, a, b)
+  return (callx("metamethod '" .. ev:sub(3) .. "'", h, a, b))
+end
+
 local function arithmeta(ev, a, b, da, db)
   local h = metamethod(a, ev) or metamethod(b, ev)
-  if h ~= nil then return (call(h, a, b)) end
+  if h ~= nil then return mmcall(ev, h, a, b) end
   -- blame the first operand that is not a number
   local culprit, d = b, db
   if tonum(a) == nil then culprit, d = a, da end
-  rterror("attempt to perform arithmetic on a " .. ltype(culprit) .. " value" .. varinfo(d))
+  rterror("attempt to perform arithmetic on a " .. objtypename(culprit) .. " value" .. varinfo(d))
 end
 
 local function bitmeta(ev, a, b, da, db)
   local h = metamethod(a, ev) or metamethod(b, ev)
-  if h ~= nil then return (call(h, a, b)) end
+  if h ~= nil then return mmcall(ev, h, a, b) end
   if tonum(a) ~= nil and tonum(b) ~= nil then
     -- blame the operand that has no integer representation
     local d = (tointeger_v(a) == nil) and da or db
@@ -341,7 +360,7 @@ local function bitmeta(ev, a, b, da, db)
   end
   local culprit, d = b, db
   if tonum(a) == nil then culprit, d = a, da end
-  rterror("attempt to perform bitwise operation on a " .. ltype(culprit) .. " value" .. varinfo(d))
+  rterror("attempt to perform bitwise operation on a " .. objtypename(culprit) .. " value" .. varinfo(d))
 end
 
 function R.add(a, b, da, db)
@@ -401,7 +420,7 @@ function R.unm(a, da)
   if x then return -x end
   local h = metamethod(a, "__unm")
   if h ~= nil then return (call(h, a, a)) end
-  rterror("attempt to perform arithmetic on a " .. ltype(a) .. " value" .. varinfo(da))
+  rterror("attempt to perform arithmetic on a " .. objtypename(a) .. " value" .. varinfo(da))
 end
 
 function R.band(a, b, da, db)
@@ -440,7 +459,7 @@ function R.bnot(a, da)
   local h = metamethod(a, "__bnot")
   if h ~= nil then return (call(h, a, a)) end
   if tonum(a) ~= nil then rterror("number has no integer representation") end
-  rterror("attempt to perform bitwise operation on a " .. ltype(a) .. " value" .. varinfo(da))
+  rterror("attempt to perform bitwise operation on a " .. objtypename(a) .. " value" .. varinfo(da))
 end
 
 ---------------------------------------------------------------------------
@@ -465,7 +484,7 @@ function R.eq(a, b)
 end
 
 local function cmperror(a, b)
-  local t1, t2 = ltype(a), ltype(b)
+  local t1, t2 = objtypename(a), objtypename(b)
   if t1 == t2 then
     rterror("attempt to compare two " .. t1 .. " values")
   end
@@ -477,7 +496,7 @@ function R.lt(a, b)
   if (ta == "number" or ta == "string") and ta == tb then return a < b end
   local h = metamethod(a, "__lt") or metamethod(b, "__lt")
   if h == nil then cmperror(a, b) end
-  return truthy((call(h, a, b)))
+  return truthy((mmcall("__lt", h, a, b)))
 end
 
 function R.le(a, b)
@@ -485,7 +504,7 @@ function R.le(a, b)
   if (ta == "number" or ta == "string") and ta == tb then return a <= b end
   local h = metamethod(a, "__le") or metamethod(b, "__le")
   if h == nil then cmperror(a, b) end
-  return truthy((call(h, a, b)))
+  return truthy((mmcall("__le", h, a, b)))
 end
 
 function R.concat(a, b, da, db)
@@ -494,10 +513,10 @@ function R.concat(a, b, da, db)
     return a .. b
   end
   local h = metamethod(a, "__concat") or metamethod(b, "__concat")
-  if h ~= nil then return (call(h, a, b)) end
+  if h ~= nil then return mmcall("__concat", h, a, b) end
   local culprit, d = b, db
   if ta == "string" or ta == "number" then culprit, d = b, db else culprit, d = a, da end
-  rterror("attempt to concatenate a " .. ltype(culprit) .. " value" .. varinfo(d))
+  rterror("attempt to concatenate a " .. objtypename(culprit) .. " value" .. varinfo(d))
 end
 
 -- Lua `#v`.
@@ -506,7 +525,7 @@ local function len(v, desc)
   local h = metamethod(v, "__len")
   if h ~= nil then return (call(h, v, v)) end   -- like Lua, the operand is passed twice
   if isTable(v) then return rawlen(v) end
-  rterror("attempt to get length of a " .. ltype(v) .. " value" .. varinfo(desc))
+  rterror("attempt to get length of a " .. objtypename(v) .. " value" .. varinfo(desc))
 end
 R.len = len
 
@@ -549,7 +568,7 @@ R.tostring = tostr
 ---------------------------------------------------------------------------
 
 local function typeerror(n, fname, expected, v)
-  local got = (v == nil) and "nil" or ltype(v)
+  local got = (v == nil) and "nil" or objtypename(v)
   local mt = getmt(v)
   if mt ~= nil and type(mt.hash.__name) == "string" then got = mt.hash.__name end
   argerror(n, fname, expected .. " expected, got " .. got)

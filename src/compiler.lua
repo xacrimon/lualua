@@ -590,12 +590,17 @@ S["if"] = function(node)
   end
 end
 
+-- Error for a non-numeric 'for' operand (wording of luaG_forerror).
+local function forerror(v, what)
+  rterror("bad 'for' " .. what .. " (number expected, got " .. R.objtypename(v) .. ")")
+end
+
 -- Limit conversion for integer loops (as forlimit in lvm.c).
 -- Returns the integer limit, or nil when the loop must be skipped.
 local function forlimit(limit, step)
   if mtype(limit) == "integer" then return limit end
   if type(limit) == "string" then limit = tonumber(limit) end
-  if type(limit) ~= "number" then rterror("'for' limit must be a number") end
+  if type(limit) ~= "number" then forerror(limit, "limit") end
   if limit ~= limit then return nil end
   local f = (step < 0) and math.ceil(limit) or math.floor(limit)
   local i = math.tointeger(f)
@@ -625,7 +630,7 @@ end
 -- numeric for-loop operands: numbers, or strings convertible to numbers
 local function forcheck(v, what)
   if type(v) == "string" then v = tonumber(v) end
-  if type(v) ~= "number" then rterror("'for' " .. what .. " must be a number") end
+  if type(v) ~= "number" then forerror(v, what) end
   return v
 end
 
