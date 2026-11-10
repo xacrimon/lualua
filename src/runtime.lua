@@ -1,0 +1,619 @@
+-- runtime.lua: value model and core semantics of the Lua 5.5 interpreter.
+--
+-- Value representation
+--   nil, boolean, number (integer/float), string, function, thread
+--                      -> the corresponding host Lua values
+--   table                -> object created by R.newtable(): a host table whose
+--                           metatable is TableMT, with fields
+--                             hash  host table holding every key/value pair
+--                             mt    Lua metatable (a Lua table) or nil
+--                             n     border hint used by R.rawlen
+--   userdata             -> object created by R.newuserdata(): host table with
+--                           metatable UserdataMT, fields payload and mt
+--
+-- Host primitives used: arithmetic/comparison on numbers and strings,
+-- tonumber(string), coroutine switching, math.tointeger. Everything with
+-- Lua-level meaning (metamethods, errors, calls, indexing) lives here.
+
+local R = {}
+
+local type, getmetatable, setmetatable = type, getmetatable, setmetatable
+local tostring, tonumber, next = tostring, tonumber, next
+local mtype, tointeger = math.type, math.tointeger
+local unpack = table.unpack
+local error = error
+
+local TableMT = {}      -- host metatable marking Lua tables
+local UserdataMT = {}   -- host metatable marking userdata
+R.TableMT = TableMT
+R.UserdataMT = UserdataMT
+
+-- Metatables for types other than table/userdata (e.g. typemt.string).
+R.typemt = {}
+
+-- Frame stack of the running coroutine. Compiled Lua functions push a frame
+-- {src = short source, line = current line} on entry and pop it on exit.
+-- Native functions do not push frames.
+R.stack = { n = 0 }
+
+---------------------------------------------------------------------------
+-- Errors
+---------------------------------------------------------------------------
+
+-- Position prefix "src:line: " of the Lua frame `level` levels from the top
+-- (level 1 = innermost Lua function). Empty string if there is no such frame.
+local function where(level)
+  local st = R.stack
+  local i = st.n - level + 1
+  local f = i >= 1 and st[i]
+  if f then return f.src .. ":" .. f.line .. ": " end
+  return ""
+end
+R.where = where
+
+-- Raise a Lua value unchanged (no position added).
+local function throw(v)
+  error(v, 0)
+end
+R.throw = throw
+
+-- Raise a runtime error message with the position of the current Lua frame.
+local function rterror(msg)
+  error(where(1) .. msg, 0)
+end
+R.rterror = rterror
+
+local function argerror(n, fname, msg)
+  rterror("bad argument #" .. n .. " to '" .. fname .. "' (" .. msg .. ")")
+end
+R.argerror = argerror
+
+---------------------------------------------------------------------------
+-- Types and metatables
+---------------------------------------------------------------------------
+
+-- Lua type name of any value.
+local function ltype(v)
+  local t = type(v)
+  if t == "table" then
+    local c = getmetatable(v)
+    if c == TableMT then return "table" end
+    if c == UserdataMT then return "userdata" end
+    error("internal: host table leaked into Lua values")
+  end
+  return t
+end
+R.type = ltype
+
+-- Lua metatable of any value (a Lua table) or nil.
+local function getmt(v)
+  local t = type(v)
+  if t == "table" then
+    local c = getmetatable(v)
+    if c == TableMT or c == UserdataMT then return v.mt end
+    return nil
+  end
+  return R.typemt[t]
+end
+R.getmt = getmt
+
+-- Raw metamethod lookup: the value of field `ev` in the metatable, or nil.
+local function metamethod(v, ev)
+  local mt = getmt(v)
+  if mt == nil then return nil end
+  return mt.hash[ev]
+end
+R.metamethod = metamethod
+
+local function isTable(v)
+  return type(v) == "table" and getmetatable(v) == TableMT
+end
+R.isTable = isTable
+
+local function isUserdata(v)
+  return type(v) == "table" and getmetatable(v) == UserdataMT
+end
+R.isUserdata = isUserdata
+
+local function newtable()
+  return setmetatable({ hash = {}, n = 0, mt = nil }, TableMT)
+end
+R.newtable = newtable
+
+function R.newuserdata(payload, mt)
+  return setmetatable({ payload = payload, mt = mt }, UserdataMT)
+end
+
+-- Weak-mode metatables for the host storage of weak Lua tables.
+local weakmts = {}
+local function weakmt(mode)
+  local m = weakmts[mode]
+  if not m then
+    m = { __mode = mode }
+    weakmts[mode] = m
+  end
+  return m
+end
+
+-- Set the Lua metatable of a table or userdata (mt is a Lua table or nil).
+function R.setmetatable(obj, mt)
+  obj.mt = mt
+  if isTable(obj) then
+    local mode = mt and mt.hash.__mode
+    if type(mode) == "string" and (mode:find("k", 1, true) or mode:find("v", 1, true)) then
+      setmetatable(obj.hash, weakmt(mode))
+    else
+      setmetatable(obj.hash, nil)
+    end
+  end
+  return obj
+end
+
+---------------------------------------------------------------------------
+-- Raw table access
+---------------------------------------------------------------------------
+
+local function rawget(t, k)
+  return t.hash[k]
+end
+R.rawget = rawget
+
+local function rawset(t, k, v)
+  if k == nil then rterror("table index is nil") end
+  if k ~= k then rterror("table index is NaN") end
+  t.hash[k] = v
+end
+R.rawset = rawset
+
+-- A border of the table (raw length). Uses t.n as a hint.
+local function rawlen(t)
+  local h, n = t.hash, t.n
+  if n > 0 and h[n] == nil then
+    repeat n = n - 1 until n == 0 or h[n] ~= nil
+  else
+    while h[n + 1] ~= nil do n = n + 1 end
+  end
+  t.n = n
+  return n
+end
+R.rawlen = rawlen
+
+-- Lua `next`: returns the key and value following k, or nil at the end.
+function R.next(t, k)
+  return next(t.hash, k)
+end
+
+---------------------------------------------------------------------------
+-- Calls
+---------------------------------------------------------------------------
+
+-- Call any Lua value with the given arguments; returns all results.
+local function call(f, ...)
+  if type(f) == "function" then return f(...) end
+  local h = metamethod(f, "__call")
+  if h == nil then rterror("attempt to call a " .. ltype(f) .. " value") end
+  return call(h, f, ...)
+end
+R.call = call
+
+-- Like call, but the error message names the called expression `desc`
+-- (for example "global 'print'"). Used by compiled code.
+local function callx(desc, f, ...)
+  if type(f) == "function" then return f(...) end
+  local h = metamethod(f, "__call")
+  if h == nil then
+    rterror("attempt to call a " .. ltype(f) .. " value" .. (desc and (" (" .. desc .. ")") or ""))
+  end
+  return call(h, f, ...)
+end
+R.callx = callx
+
+---------------------------------------------------------------------------
+-- Indexing
+---------------------------------------------------------------------------
+
+local function varinfo(desc)
+  return desc and (" (" .. desc .. ")") or ""
+end
+R.varinfo = varinfo
+
+-- o[k] with the __index metamethod chain. desc names o for error messages.
+local function index(o, k, desc)
+  for _ = 1, 2000 do
+    local h
+    if type(o) == "table" and getmetatable(o) == TableMT then
+      local v = o.hash[k]
+      if v ~= nil then return v end
+      local mt = o.mt
+      if mt == nil then return nil end
+      h = mt.hash.__index
+      if h == nil then return nil end
+    else
+      local mt = getmt(o)
+      if mt == nil then
+        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+      end
+      h = mt.hash.__index
+      if h == nil then
+        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+      end
+    end
+    if type(h) == "function" then return (h(o, k)) end
+    o = h
+    desc = nil
+  end
+  rterror("'__index' chain too long; possibly a loop")
+end
+R.index = index
+
+-- o[k] = v with the __newindex metamethod chain.
+local function setindex(o, k, v, desc)
+  for _ = 1, 2000 do
+    local h
+    if type(o) == "table" and getmetatable(o) == TableMT then
+      local hash = o.hash
+      if hash[k] ~= nil then
+        hash[k] = v
+        return
+      end
+      local mt = o.mt
+      h = mt and mt.hash.__newindex
+      if h == nil then
+        rawset(o, k, v)
+        return
+      end
+    else
+      local mt = getmt(o)
+      if mt == nil then
+        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+      end
+      h = mt.hash.__newindex
+      if h == nil then
+        rterror("attempt to index a " .. ltype(o) .. " value" .. varinfo(desc))
+      end
+    end
+    if type(h) == "function" then
+      h(o, k, v)
+      return
+    end
+    o = h
+    desc = nil
+  end
+  rterror("'__newindex' chain too long; possibly a loop")
+end
+R.setindex = setindex
+
+---------------------------------------------------------------------------
+-- Numbers and coercions
+---------------------------------------------------------------------------
+
+-- Number value of v for arithmetic (numbers and numeric strings), or nil.
+local function tonum(v)
+  local t = type(v)
+  if t == "number" then return v end
+  if t == "string" then return tonumber(v) end
+  return nil
+end
+R.tonum = tonum
+
+-- Integer value of v for bitwise operations, or nil.
+local function tointeger_v(v)
+  local x = tonum(v)
+  if x == nil then return nil end
+  return tointeger(x)
+end
+R.tointegerv = tointeger_v
+
+-- Lua `tonumber(v)`: number, numeric string converted, or nil.
+function R.tonumber(v)
+  return tonum(v)
+end
+
+-- Lua `math.tointeger`-like conversion (numbers and numeric strings).
+function R.tointeger(v)
+  return tointeger_v(v)
+end
+
+---------------------------------------------------------------------------
+-- Arithmetic
+---------------------------------------------------------------------------
+
+local function arithmeta(ev, a, b, da, db)
+  local h = metamethod(a, ev) or metamethod(b, ev)
+  if h ~= nil then return (call(h, a, b)) end
+  -- blame the first operand that is not a number
+  local culprit, d = b, db
+  if tonum(a) == nil then culprit, d = a, da end
+  rterror("attempt to perform arithmetic on a " .. ltype(culprit) .. " value" .. varinfo(d))
+end
+
+local function bitmeta(ev, a, b, da, db)
+  local h = metamethod(a, ev) or metamethod(b, ev)
+  if h ~= nil then return (call(h, a, b)) end
+  if tonum(a) ~= nil and tonum(b) ~= nil then
+    rterror("number has no integer representation")
+  end
+  local culprit, d = b, db
+  if tonum(a) == nil then culprit, d = a, da end
+  rterror("attempt to perform bitwise operation on a " .. ltype(culprit) .. " value" .. varinfo(d))
+end
+
+function R.add(a, b, da, db)
+  local x, y = tonum(a), tonum(b)
+  if x and y then return x + y end
+  return arithmeta("__add", a, b, da, db)
+end
+
+function R.sub(a, b, da, db)
+  local x, y = tonum(a), tonum(b)
+  if x and y then return x - y end
+  return arithmeta("__sub", a, b, da, db)
+end
+
+function R.mul(a, b, da, db)
+  local x, y = tonum(a), tonum(b)
+  if x and y then return x * y end
+  return arithmeta("__mul", a, b, da, db)
+end
+
+function R.div(a, b, da, db)
+  local x, y = tonum(a), tonum(b)
+  if x and y then return x / y end
+  return arithmeta("__div", a, b, da, db)
+end
+
+function R.pow(a, b, da, db)
+  local x, y = tonum(a), tonum(b)
+  if x and y then return x ^ y end
+  return arithmeta("__pow", a, b, da, db)
+end
+
+function R.mod(a, b, da, db)
+  local x, y = tonum(a), tonum(b)
+  if x and y then
+    if mtype(x) == "integer" and mtype(y) == "integer" then
+      if y == 0 then rterror("attempt to perform 'n%0'") end
+    end
+    return x % y
+  end
+  return arithmeta("__mod", a, b, da, db)
+end
+
+function R.idiv(a, b, da, db)
+  local x, y = tonum(a), tonum(b)
+  if x and y then
+    if mtype(x) == "integer" and mtype(y) == "integer" then
+      if y == 0 then rterror("attempt to perform 'n//0'") end
+    end
+    return x // y
+  end
+  return arithmeta("__idiv", a, b, da, db)
+end
+
+function R.unm(a, da)
+  local x = tonum(a)
+  if x then return -x end
+  local h = metamethod(a, "__unm")
+  if h ~= nil then return (call(h, a, a)) end
+  rterror("attempt to perform arithmetic on a " .. ltype(a) .. " value" .. varinfo(da))
+end
+
+function R.band(a, b, da, db)
+  local x, y = tointeger_v(a), tointeger_v(b)
+  if x and y then return x & y end
+  return bitmeta("__band", a, b, da, db)
+end
+
+function R.bor(a, b, da, db)
+  local x, y = tointeger_v(a), tointeger_v(b)
+  if x and y then return x | y end
+  return bitmeta("__bor", a, b, da, db)
+end
+
+function R.bxor(a, b, da, db)
+  local x, y = tointeger_v(a), tointeger_v(b)
+  if x and y then return x ~ y end
+  return bitmeta("__bxor", a, b, da, db)
+end
+
+function R.shl(a, b, da, db)
+  local x, y = tointeger_v(a), tointeger_v(b)
+  if x and y then return x << y end
+  return bitmeta("__shl", a, b, da, db)
+end
+
+function R.shr(a, b, da, db)
+  local x, y = tointeger_v(a), tointeger_v(b)
+  if x and y then return x >> y end
+  return bitmeta("__shr", a, b, da, db)
+end
+
+function R.bnot(a, da)
+  local x = tointeger_v(a)
+  if x then return ~x end
+  local h = metamethod(a, "__bnot")
+  if h ~= nil then return (call(h, a, a)) end
+  if tonum(a) ~= nil then rterror("number has no integer representation") end
+  rterror("attempt to perform bitwise operation on a " .. ltype(a) .. " value" .. varinfo(da))
+end
+
+---------------------------------------------------------------------------
+-- Comparison, concatenation, length
+---------------------------------------------------------------------------
+
+local function truthy(v)
+  return v ~= nil and v ~= false
+end
+R.truthy = truthy
+
+function R.eq(a, b)
+  if a == b then return true end
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  local ca, cb = getmetatable(a), getmetatable(b)
+  if (ca ~= TableMT and ca ~= UserdataMT) or (cb ~= TableMT and cb ~= UserdataMT) then
+    return false
+  end
+  local h = metamethod(a, "__eq") or metamethod(b, "__eq")
+  if h == nil then return false end
+  return truthy((call(h, a, b)))
+end
+
+local function cmperror(a, b)
+  local t1, t2 = ltype(a), ltype(b)
+  if t1 == t2 then
+    rterror("attempt to compare two " .. t1 .. " values")
+  end
+  rterror("attempt to compare " .. t1 .. " with " .. t2)
+end
+
+function R.lt(a, b)
+  local ta, tb = type(a), type(b)
+  if (ta == "number" or ta == "string") and ta == tb then return a < b end
+  local h = metamethod(a, "__lt") or metamethod(b, "__lt")
+  if h == nil then cmperror(a, b) end
+  return truthy((call(h, a, b)))
+end
+
+function R.le(a, b)
+  local ta, tb = type(a), type(b)
+  if (ta == "number" or ta == "string") and ta == tb then return a <= b end
+  local h = metamethod(a, "__le") or metamethod(b, "__le")
+  if h == nil then cmperror(a, b) end
+  return truthy((call(h, a, b)))
+end
+
+function R.concat(a, b, da, db)
+  local ta, tb = type(a), type(b)
+  if (ta == "string" or ta == "number") and (tb == "string" or tb == "number") then
+    return a .. b
+  end
+  local h = metamethod(a, "__concat") or metamethod(b, "__concat")
+  if h ~= nil then return (call(h, a, b)) end
+  local culprit, d = b, db
+  if ta == "string" or ta == "number" then culprit, d = b, db else culprit, d = a, da end
+  rterror("attempt to concatenate a " .. ltype(culprit) .. " value" .. varinfo(d))
+end
+
+-- Lua `#v`.
+local function len(v, desc)
+  if type(v) == "string" then return #v end
+  local h = metamethod(v, "__len")
+  if h ~= nil then return (call(h, v)) end
+  if isTable(v) then return rawlen(v) end
+  rterror("attempt to get length of a " .. ltype(v) .. " value" .. varinfo(desc))
+end
+R.len = len
+
+---------------------------------------------------------------------------
+-- tostring
+---------------------------------------------------------------------------
+
+-- Address part of the host representation, e.g. "0x5581...".
+local function addr_of(v)
+  return (tostring(v):gsub("^[^:]+: ", ""))
+end
+
+-- Lua `tostring(v)` (honours __tostring and __name).
+local function tostr(v)
+  local t = type(v)
+  if t == "string" then return v end
+  if t == "number" then return tostring(v) end
+  if t == "nil" or t == "boolean" then return tostring(v) end
+  local h = metamethod(v, "__tostring")
+  if h ~= nil then
+    local s = (call(h, v))
+    if type(s) == "number" then return tostring(s) end
+    if type(s) ~= "string" then rterror("'__tostring' must return a string") end
+    return s
+  end
+  local lt = ltype(v)
+  local name = metamethod(v, "__name")
+  if type(name) == "string" and (lt == "table" or lt == "userdata") then
+    return name .. ": " .. addr_of(v)
+  end
+  if lt == "table" or lt == "userdata" then
+    return lt .. ": " .. addr_of(v)
+  end
+  return tostring(v)
+end
+R.tostring = tostr
+
+---------------------------------------------------------------------------
+-- Argument checking helpers for library functions
+---------------------------------------------------------------------------
+
+local function typeerror(n, fname, expected, v)
+  local got = (v == nil) and "nil" or ltype(v)
+  local mt = getmt(v)
+  if mt ~= nil and type(mt.hash.__name) == "string" then got = mt.hash.__name end
+  argerror(n, fname, expected .. " expected, got " .. got)
+end
+R.typeerror = typeerror
+
+function R.checkinteger(v, n, fname)
+  if mtype(v) == "integer" then return v end
+  local x = tonum(v)
+  if x == nil then typeerror(n, fname, "number", v) end
+  local i = tointeger(x)
+  if i == nil then argerror(n, fname, "number has no integer representation") end
+  return i
+end
+
+function R.optinteger(v, n, fname, default)
+  if v == nil then return default end
+  return R.checkinteger(v, n, fname)
+end
+
+function R.checknumber(v, n, fname)
+  local x = tonum(v)
+  if x == nil then typeerror(n, fname, "number", v) end
+  return x
+end
+
+function R.optnumber(v, n, fname, default)
+  if v == nil then return default end
+  return R.checknumber(v, n, fname)
+end
+
+function R.checkstring(v, n, fname)
+  local t = type(v)
+  if t == "string" then return v end
+  if t == "number" then return tostring(v) end
+  typeerror(n, fname, "string", v)
+end
+
+function R.optstring(v, n, fname, default)
+  if v == nil then return default end
+  return R.checkstring(v, n, fname)
+end
+
+function R.checktable(v, n, fname)
+  if not isTable(v) then typeerror(n, fname, "table", v) end
+  return v
+end
+
+function R.checkfunction(v, n, fname)
+  if type(v) ~= "function" then typeerror(n, fname, "function", v) end
+  return v
+end
+
+---------------------------------------------------------------------------
+-- Library installation helper
+---------------------------------------------------------------------------
+
+-- Store the functions of `fns` (name -> value) into Lua table t.
+function R.setfuncs(t, fns)
+  for k, v in pairs(fns) do
+    t.hash[k] = v
+  end
+  return t
+end
+
+-- Build a Lua table from a host array (values 1..n) with field n = count.
+function R.fromarray(arr, n)
+  local t = newtable()
+  for i = 1, n or #arr do t.hash[i] = arr[i] end
+  return t
+end
+
+return R
