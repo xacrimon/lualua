@@ -97,20 +97,42 @@ meaning "the Lua function that called error".
 lualua.lua          CLI entry point: lua lualua.lua [options] [script [args]]
 src/runtime.lua     value model, metamethods, arithmetic, errors, arg checks
 src/lexer.lua       tokenizer
-src/parser.lua      recursive-descent parser -> AST with resolved scopes
-src/compiler.lua    AST -> Lua closures (the "interpreter" proper)
-src/interp.lua      builds the global environment, loads libraries, loads chunks
-src/lib/base.lua    print, pairs, pcall, load, select, ...
+src/parser.lua      recursive-descent parser -> AST with resolved scopes,
+                    global-declaration and goto/label checks
+src/compiler.lua    AST -> Lua closures (the "interpreter" proper); activation
+                    records A are also the stack frames
+src/loader.lua      source text -> Lua function (chunkid, load)
+src/interp.lua      builds the global environment, loads libraries
+src/lib/base.lua    print, pairs, pcall, load, select, require, collectgarbage, ...
 src/lib/string.lua  string library incl. Lua patterns, format, pack/unpack
 src/lib/table.lua   table library
-src/lib/math.lua    math library
+src/lib/math.lua    math library (incl. frexp/ldexp and compat functions)
 src/lib/utf8.lua    utf8 library
 src/lib/os.lua      os library
 src/lib/io.lua      io library (files are userdata)
-src/lib/coroutine.lua coroutine library
-src/lib/debug.lua   partial debug library
-tests/              our own test scripts (runner: tests/run.sh)
+src/lib/coroutine.lua coroutine library (host coroutines, per-coroutine frame stack)
+src/lib/debug.lua   partial debug library (getinfo names/lines, upvalue access)
+tests/run_testes.sh run files of the official suite (default: all but heavy.lua)
+tests/where.sh      report the first failing assertion location per file
 ```
+
+## Debugging aids
+
+- `LUALUA_DEBUG=1` makes a failing `assert` print its position on stderr.
+- Each Lua frame records `src`, `line` and the call-site description `cdesc`
+  (used by `debug.getinfo(level, "n")`).
+
+## Status against the official suite
+
+See `git log` for the milestones. Known gaps (not implemented or deviating):
+
+- Closing a suspended coroutine does not run its pending `__close` handlers.
+- `global *` (goto scope check against `global` declarations) is not checked.
+- Argument errors say `got nil`, not `got no value`.
+- `%p` / interned-string identity is not modelled.
+- `table.create` does not reserve memory; `collectgarbage("count")` is host-based.
+- C-stack overflow in nested `pcall` is not reproduced exactly.
+- `require` search-failure messages list only the Lua path templates.
 
 ## Lua 5.5 specifics to keep in mind
 
