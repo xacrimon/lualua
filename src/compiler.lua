@@ -54,7 +54,7 @@ local function describe(node)
     if node.gname then return "global '" .. node.gname .. "'" end
     if node.key.k == "str" then return "field '" .. node.key.v .. "'" end
   end
-  if k == "method" then return "method '" .. node.name .. "'" end
+  if k == "method" then return (node.field and "field '" or "method '") .. node.name .. "'" end
   return nil
 end
 
@@ -343,9 +343,11 @@ cmulti = function(node)
     return function(A)
       local fv = f(A)
       local a = pack(argsf(A))
-      -- the caller records the callee's description (for debug.getinfo names)
+      -- the caller records the callee's description and argument count (for
+      -- argument error messages and debug.getinfo names)
       A.line = line
       A.cdesc = d
+      A.nargs = a.n
       if type(fv) == "function" then return fv(unpack(a, 1, a.n)) end
       return callx(d, fv, unpack(a, 1, a.n))
     end
@@ -355,13 +357,14 @@ cmulti = function(node)
     local name = node.name
     local d = describe(node.obj)
     local line = node.line
-    local mdesc = "method '" .. name .. "'"
+    local mdesc = (node.field and "field '" or "method '") .. name .. "'"
     return function(A)
       local ob = o(A)
       local fv = index(ob, name, d)
       local a = pack(argsf(A))
       A.line = line
       A.cdesc = mdesc
+      A.nargs = a.n + 1   -- the receiver counts
       if type(fv) == "function" then return fv(ob, unpack(a, 1, a.n)) end
       return callx(mdesc, fv, ob, unpack(a, 1, a.n))
     end
@@ -757,6 +760,7 @@ S["return"] = function(node)
         local fv = f(A)
         local args = pack(argsf(A))
         A.line = line
+        A.cdesc, A.nargs = d, args.n
         return TAILCALL, { fv, args, d }
       end
     else
@@ -769,7 +773,9 @@ S["return"] = function(node)
         local fv = index(ob, name, d)
         local args = pack(ob, argsf(A))
         A.line = line
-        return TAILCALL, { fv, args, "method '" .. name .. "'" }
+        local mdesc = (c.field and "field '" or "method '") .. name .. "'"
+        A.cdesc, A.nargs = mdesc, args.n
+        return TAILCALL, { fv, args, mdesc }
       end
     end
   end
@@ -1012,6 +1018,14 @@ function C.newlua(c, ups)
     st[d] = A
     st.n = d
     local sig, val = run(A)
+    if sig == TAILCALL and FUPS[val[1]] == nil then
+      -- a native is not a real tail call: call it while this frame is still there
+      -- (argument errors then see the right call site)
+      local r = pack(callx(val[3], val[1], unpack(val[2], 1, val[2].n)))
+      st[d] = nil
+      st.n = d - 1
+      return unpack(r, 1, r.n)
+    end
     st[d] = nil
     st.n = d - 1
     if sig == RETURN then return unpack(val, 1, val.n) end

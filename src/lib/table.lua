@@ -257,10 +257,12 @@ return function(G)
     sort = function(...)
       -- the comparator and metamethods run from a C boundary: not yieldable
       local st = R.stack
-      local saved = st.nny or 0
+      local saved, savednat = st.nny or 0, st.nat
       st.nny = saved + 1
+      st.nat = st.n   -- the comparator is called from a native (no Lua call site)
       local r = pack(tsort(...))
       st.nny = saved
+      st.nat = savednat
       return unpack(r, 1, r.n)
     end,
     unpack = tunpack,

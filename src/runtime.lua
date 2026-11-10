@@ -78,7 +78,56 @@ local function rterror(msg)
 end
 R.rterror = rterror
 
+-- The Lua frame that called the running native, or nil if a native called it
+-- (no Lua call site: the function is then named by its global name).
+local function callerframe()
+  local st = R.stack
+  if st.nat == st.n then return nil end
+  return st[st.n]
+end
+
+-- Global name of a library function (as luaL_argerror's pushglobalfuncname):
+-- searches the loaded modules for the function itself (fobj), or else for a
+-- function stored under fname.
+local function qualifiedname(fname, fobj)
+  local loaded = R.loadedtable
+  if loaded ~= nil then
+    -- global functions are named without their module (_G.print is "print")
+    local g = loaded.hash._G
+    if fobj ~= nil then
+      for mk, mod in next, loaded.hash do
+        if R.isTable(mod) then
+          for fk, fv in next, mod.hash do
+            if fv == fobj and type(fk) == "string" then
+              return (mk == "_G") and fk or (mk .. "." .. fk)
+            end
+          end
+        end
+      end
+    end
+    if fobj ~= nil then return fname end   -- known function, not in a loaded module
+    if R.isTable(g) and type(g.hash[fname]) == "function" then return fname end
+    local k, mod = next(loaded.hash, nil)
+    while k ~= nil do
+      if R.isTable(mod) and type(mod.hash[fname]) == "function" then
+        return (k == "_G") and fname or (k .. "." .. fname)
+      end
+      k, mod = next(loaded.hash, k)
+    end
+  end
+  return fname
+end
+
 local function argerror(n, fname, msg)
+  local st = R.stack
+  local cf = callerframe()
+  local desc = cf and cf.cdesc
+  if desc and desc:sub(1, 8) == "method '" then
+    -- method call: the receiver is argument 1 for the call but not for the function
+    n = n - 1
+    if n == 0 then rterror("calling '" .. fname .. "' on bad self (" .. msg .. ")") end
+  end
+  if cf == nil then fname = qualifiedname(fname, st.natfn) end
   rterror("bad argument #" .. n .. " to '" .. fname .. "' (" .. msg .. ")")
 end
 R.argerror = argerror
@@ -253,10 +302,15 @@ R.call = call
 -- yieldable, so the coroutine's non-yieldable depth is raised meanwhile.
 function R.ccall(f, ...)
   local st = R.stack
-  local saved = st.nny or 0
+  local saved, savednat = st.nny or 0, st.nat
   st.nny = saved + 1
+  st.nat = st.n   -- a native called from here has no Lua call site
+  local savedn, savedf = st.natnargs, st.natfn
+  st.natnargs, st.natfn = select("#", ...), f
   local r = pack(call(f, ...))
+  st.natnargs, st.natfn = savedn, savedf
   st.nny = saved
+  st.nat = savednat
   return unpack(r, 1, r.n)
 end
 
@@ -610,6 +664,14 @@ R.tostring = tostr
 
 local function typeerror(n, fname, expected, v)
   local got = (v == nil) and "nil" or objtypename(v)
+  if v == nil then
+    -- an argument past the ones the caller passed is "no value"
+    local st = R.stack
+    local nargs
+    if st.nat == st.n then nargs = st.natnargs    -- called from a native
+    elseif st.n > 0 then nargs = st[st.n].nargs end
+    if nargs and n > nargs then got = "no value" end
+  end
   local mt = getmt(v)
   if mt ~= nil and type(mt.hash.__name) == "string" then got = mt.hash.__name end
   argerror(n, fname, expected .. " expected, got " .. got)

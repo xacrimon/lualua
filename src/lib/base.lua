@@ -166,11 +166,13 @@ return function(G)
   local function pcall_(f, ...)
     local st = R.stack
     local n = st.n
-    local savednat, savednny = st.nat, st.nny
-    if FUPS[f] == nil then st.nat = n end   -- a native called directly by pcall
+    local savednat, savednny, savednn, savedf = st.nat, st.nny, st.natnargs, st.natfn
+    if FUPS[f] == nil then                  -- a native called directly by pcall
+      st.nat = n
+      st.natnargs, st.natfn = select("#", ...), f
+    end
     local r = pack(pcall(R.call, f, ...))
-    st.nat = savednat
-    st.nny = savednny
+    st.nat, st.nny, st.natnargs, st.natfn = savednat, savednny, savednn, savedf
     if not r[1] then
       st.n = n
       if r[2] == R.CLOSING then error(R.CLOSING, 0) end   -- not catchable here
@@ -198,6 +200,19 @@ return function(G)
     return false, hr[2]
   end
 
+  -- error for a chunk whose kind (binary or text) is not allowed by mode
+  local function chunkmodeerror(src, mode)
+    local binary = src:sub(1, 1) == "\27"
+    if binary and not mode:find("b", 1, true) then
+      return "attempt to load a binary chunk (mode is '" .. mode .. "')"
+    elseif not binary and not mode:find("t", 1, true) then
+      return "attempt to load a text chunk (mode is '" .. mode .. "')"
+    elseif binary then
+      return "binary chunks are not supported"
+    end
+    return nil
+  end
+
   local function load_(chunk, chunkname, mode, ...)
     local src
     if type(chunk) == "string" then
@@ -220,11 +235,10 @@ return function(G)
     end
     if mode ~= nil then
       mode = R.checkstring(mode, 3, "load")
-      -- only text chunks are supported (no precompiled binary chunks)
-      if not mode:find("t", 1, true) then
-        return nil, "attempt to load a text chunk (mode is '" .. mode .. "')"
-      end
+      if mode:find("[^bt]") then R.argerror(3, "load", "invalid mode") end
     end
+    local merr = chunkmodeerror(src, mode or "bt")
+    if merr then return nil, merr end
     local e = G
     if select("#", ...) >= 1 then e = (...) end   -- explicit env argument (even nil)
     local f, err = loader.load(src, chunkname or src, e)
@@ -250,11 +264,15 @@ return function(G)
       if not src then return nil, "cannot open " .. path .. (err and (": " .. err:gsub("^[^:]*: ", "")) or "") end
       path = "@" .. path
     end
+    -- a UTF-8 byte order mark and a first line starting with '#' are skipped
+    if src:sub(1, 3) == "\239\187\191" then src = src:sub(4) end
     if src:sub(1, 1) == "#" then
       src = "--" .. src
     end
     local e = G
     if select("#", ...) >= 1 then e = (...) end
+    local merr = chunkmodeerror(src, mode or "bt")
+    if merr then return nil, merr end
     local f, lerr = loader.load(src, path, e)
     if not f then return nil, lerr end
     return f
@@ -309,6 +327,7 @@ return function(G)
 
   local package = R.newtable()
   local loaded = R.newtable()
+  R.loadedtable = loaded   -- used to name library functions in argument errors
   local preload = R.newtable()
   package.hash.loaded = loaded
   package.hash.preload = preload

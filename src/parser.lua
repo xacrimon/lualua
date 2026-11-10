@@ -77,6 +77,18 @@ end
 -- Scopes
 ---------------------------------------------------------------------------
 
+-- Index of string constant s in the current function's constant table (as
+-- Lua's compiler numbers constants). Used to pick "method" or "field" naming.
+local function addconst(s)
+  local t = fs.consts
+  if t == nil then t = {}; fs.consts = t; fs.nconsts = 0 end
+  if t[s] == nil then
+    fs.nconsts = fs.nconsts + 1
+    t[s] = fs.nconsts
+  end
+  return t[s]
+end
+
 local function newfs(parent, isvararg)
   return {
     parent = parent,
@@ -190,6 +202,7 @@ end
 local function singlevar(name, line)
   local vi = findlocal(fs, name)
   if vi and vi ~= "global" then return { k = "local", var = vi, name = name } end
+  addconst(name)
   local ui = (vi == nil) and findupval(fs, name) or nil
   if ui then return { k = "upval", idx = ui, name = name } end
   -- a global
@@ -283,8 +296,11 @@ local function suffixedexp()
     elseif t == ":" then
       ls:advance()
       local name = checkname()
+      -- Lua uses a SELF instruction only for small constant indices; beyond that
+      -- the call is named as a field
+      local field = addconst(name) > 255
       local args, cline = callargs()
-      e = { k = "method", obj = e, name = name, args = args, line = cline }
+      e = { k = "method", obj = e, name = name, args = args, line = cline, field = field }
     elseif t == "(" or t == "string" or t == "{" then
       local args, cline = callargs()
       e = { k = "call", fn = e, args = args, line = cline }

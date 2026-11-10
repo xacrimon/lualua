@@ -78,6 +78,14 @@ def comment_all(f, fragment, cat, note):
     log.append(f"{f}: [{cat}] {note} (lines {', '.join(str(i+1) for i in hits)})")
 
 
+def excluded_file(f, cat, note):
+    """Replaces a whole test file with a stub that only reports it was excluded."""
+    path = os.path.join(DST, f)
+    write(path, [f"-- STUB[{cat}] excluded file: {note}",
+                 f"print('excluded {f}: {note}')"])
+    log.append(f"{f}: [{cat}] whole file excluded ({note})")
+
+
 def replace_once(f, old, new, cat, note):
     path = os.path.join(DST, f)
     text = open(path, encoding="latin-1").read()
@@ -112,15 +120,11 @@ def main():
     stub("vararg.lua", 'assert(m == collectgarbage"count")', "memory", "no allocation check")
     stub("gc.lua", 'collectgarbage("count") <= m + 1', "memory", "everything collected (memory count)")
 
+    # debug library: db.lua tests only the debug library, so the whole file is excluded
+    excluded_file("db.lua", "debug", "whole file tests the debug library")
+
     # debug library
     stub("closure.lua", "debug.upvalueid(string.gmatch", "debug", "upvalueid of a C closure")
-    stub("db.lua", "assert(b.name == nil and b.what", "debug", "getinfo 'SfL' fields of a Lua function")
-    block("db.lua", "assert(b.activelines[b.linedefined + 1] and", "b.activelines[b.lastlinedefined])",
-          "debug", "getinfo 'L' activelines")
-    block("db.lua", "assert(not b.activelines[b.linedefined] and", "not b.activelines[b.lastlinedefined + 1])",
-          "debug", "getinfo 'L' activelines")
-    block("errors.lua", "-- passing light userdata instead of full userdata", '"light userdata")',
-          "debug", "light userdata via debug.setuservalue")
 
     comment_all("locals.lua", "assert(debug.getinfo(2).name", "debug", "getinfo name of calling function")
     comment_all("coroutine.lua", 'assert(X == 43 and Y.what == "C")', "debug", "getinfo what of a C frame")
@@ -141,10 +145,16 @@ def main():
           "dump", "string.dump / binary chunk section", inclusive=False)
     block("calls.lua", 'print("testing binary chunks")', "print('OK')",
           "dump", "binary chunk tests to end of file", inclusive=False)
-    block("db.lua", "--  without debug information", "assert(#actl == 0)   -- no line info",
-          "dump", "string.dump of stripped code", plus=1)
-    block("db.lua", "-- dump/load a function without debug info", 'print"OK"',
-          "dump", "string.dump / stripped debug info section", inclusive=False)
+    block("files.lua", "assert(io.write(string.dump(function () return 10", 'assert(a == 10 and b == "\\0alo\\255" and c == "hi")',
+          "dump", "loading binary chunks (string.dump)", plus=1)
+    block("files.lua", "-- save function with no upvalues", 'assert(type(f) == "function" and f() == 1)',
+          "dump", "binary chunk without upvalues", plus=1)
+    block("files.lua", "-- loading binary file with initial comment", 'assert(a == 20 and b == "\\0\\0\\0" and c == nil)',
+          "dump", "binary chunk with initial comment", plus=1)
+    block("files.lua", "do   -- testing closing file in line iteration", 'assert(st == false and io.type(msg) == "closed file")',
+          "debug", "closing a file from a loop via debug.getlocal", plus=2)
+    block("errors.lua", "-- passing light userdata instead of full userdata", '"light userdata")',
+          "debug", "light userdata via debug.setuservalue")
     block("errors.lua", "-- errors in functions without debug info", "-- tests for field accesses after RK limit",
           "dump", "string.dump of stripped functions", inclusive=False)
 

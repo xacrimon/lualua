@@ -79,6 +79,7 @@ local function main(argv)
     if not fh then die("cannot open " .. script) end
     local src = fh:read("a")
     fh:close()
+    if src:sub(1, 3) == "\239\187\191" then src = src:sub(4) end
     if src:sub(1, 1) == "#" then src = "--" .. src end
     runchunk(G, src, "@" .. script, scriptargs)
   elseif #exec == 0 then
