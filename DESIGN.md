@@ -130,10 +130,26 @@ Test workflow:
   log is `tests/adapted/STUBLOG.txt`. The official directory is never modified.
 - `tests/run_testes.sh` runs the adapted suite (default); `tests/where.sh <file>`
   reports the first failing assertion.
-- Excluded (stubbed, tagged `STUB[category]`): `debug` (debug library; the file
-  `db.lua` is excluded whole), `dump` (`string.dump` and binary chunks),
-  `pointer` (address identity, string interning), `memory`
-  (`collectgarbage("count")` measurements).
+- Excluded (stubbed, tagged `STUB[category]`): `debug` (debug library behaviour,
+  section by section; `db.lua` keeps its sections of plain Lua), `dump`
+  (`string.dump` and binary chunks), `pointer` (address identity, string
+  interning), `memory` (`collectgarbage("count")` measurements).
+- The adapted copy keeps the official line numbers: the stub prelude shares the
+  first line of each file.
+
+Debug library, as implemented (`src/lib/debug.lua`) and as stubbed:
+- `getinfo`: `what`, `source`, `short_src`, `currentline`, `linedefined`,
+  `lastlinedefined`, `func`, `name`/`namewhat` (from call descriptions) are
+  supported. Missing: `activelines` (`L`), `nparams`, `nups`, `isvararg`,
+  `istailcall`, `ftransfer`/`ntransfer`, `nparams` for C functions, and
+  name/namewhat `metamethod` and `for iterator` for frames not on the stack.
+- `sethook`, `gethook`: accepted but inert (no events are delivered; `gethook`
+  returns nothing). Line, call, return and count hooks are not implemented.
+- `getlocal`: always returns nothing. `setlocal`, `getuservalue`,
+  `setuservalue`, `debug.getregistry` are not provided.
+- `traceback`: one line per Lua frame without level or thread arguments; not
+  the reference layout.
+- Upvalue functions work only for closures created by `compiler.lua`.
 
 Known gaps that remain (not excluded):
 - Argument errors: a missing argument is "no value" only when the caller's
@@ -143,7 +159,21 @@ Known gaps that remain (not excluded):
 - Deep recursion to the frame limit is slow (about a minute for
   `cstack.lua`): frames are heavier than the reference's.
 - `coroutine.isyieldable` and yields across library callbacks model only
-  `gsub` and `table.sort`.
+  `gsub` and `table.sort`; other natives that call Lua (`tostring` with
+  `__tostring`, `load`'s reader, ...) let a yield through where the reference
+  raises "attempt to yield across a C-call boundary".
+- Finalizers run from the host collector, so their timing and order are the
+  host's, not the reference's. An error inside `__gc` is discarded; the
+  reference reports it as a warning.
+- `collectgarbage("param")` stores the values and returns them but does not
+  change the collector. `collectgarbage("count")` is the host's memory figure.
+- Lua call depth is capped at 50000 frames (`MAXDEPTH` in `compiler.lua`); the
+  reference overflows by stack size, so the depth at which "stack overflow"
+  appears differs.
+- In `db.lua`, the line-trace helper `test` (lines 19-29) no longer checks
+  anything, because its `assert(#l == 0)` is stubbed. The `test([[...]], {...})`
+  calls that remain in the file therefore verify nothing (the large-gap loop
+  that also uses `test` is stubbed as a whole).
 
 ## Lua 5.5 specifics to keep in mind
 

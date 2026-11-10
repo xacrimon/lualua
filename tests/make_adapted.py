@@ -20,7 +20,8 @@ SRC = os.environ.get("LUA_TESTES", "/home/acrimon/work/lua/testes")
 OUT = os.path.join(HERE, "adapted")
 DST = os.path.join(OUT, "testes")
 LOG = os.path.join(OUT, "STUBLOG.txt")
-PRELUDE = "function _stub(...) return ... end\n"
+# no newline: the prelude shares the first line, so line numbers match the official suite
+PRELUDE = "function _stub(...) return ... end "
 log = []
 
 
@@ -47,12 +48,18 @@ def stub(f, fragment, cat, note, nth=None):
     log.append(f"{f}: [{cat}] {note}")
 
 
-def block(f, start, end, cat, note, plus=0, inclusive=True):
+def block(f, start, end, cat, note, plus=0, inclusive=True, next_line=None):
     """Comments out lines from the line containing start to the line containing end
-    (inclusive by default; the end line is the last line of the statement)."""
+    (inclusive by default; the end line is the last line of the statement).
+    With next_line, start must be a line equal to start (stripped) whose following
+    line contains next_line (for bare keywords such as 'do')."""
     path = os.path.join(DST, f)
     lines = read(path)
-    s = [i for i, l in enumerate(lines) if start in l]
+    if next_line is None:
+        s = [i for i, l in enumerate(lines) if start in l]
+    else:
+        s = [i for i, l in enumerate(lines)
+             if l.strip() == start and i + 1 < len(lines) and next_line in lines[i + 1]]
     e = [i for i, l in enumerate(lines) if end in l]
     if len(s) != 1 or len(e) != 1 or e[0] <= s[0]:
         sys.exit(f"{f}: block markers not unique/ordered: {len(s)} {len(e)}")
@@ -61,6 +68,29 @@ def block(f, start, end, cat, note, plus=0, inclusive=True):
         lines[j] = "-- STUB[" + cat + "] " + lines[j]
     write(path, lines)
     log.append(f"{f}: [{cat}] {note} (lines {s[0]+1}-{stop})")
+
+
+def stmt(f, fragment, cat, note):
+    """Comments out a whole (possibly multi-line) statement that starts on the line
+    containing fragment, up to the line where its parentheses balance again."""
+    path = os.path.join(DST, f)
+    lines = read(path)
+    hits = [i for i, l in enumerate(lines) if fragment in l]
+    if len(hits) != 1:
+        sys.exit(f"{f}: fragment {fragment!r} matched {len(hits)} lines")
+    s = hits[0]
+    depth, j = 0, s
+    while True:
+        depth += lines[j].count("(") - lines[j].count(")")
+        if depth <= 0:
+            break
+        j += 1
+        if j >= len(lines):
+            sys.exit(f"{f}: unbalanced statement at line {s+1}")
+    for k in range(s, j + 1):
+        lines[k] = "-- STUB[" + cat + "] " + lines[k]
+    write(path, lines)
+    log.append(f"{f}: [{cat}] {note} (lines {s+1}-{j+1})")
 
 
 def comment_all(f, fragment, cat, note):
@@ -78,22 +108,76 @@ def comment_all(f, fragment, cat, note):
     log.append(f"{f}: [{cat}] {note} (lines {', '.join(str(i+1) for i in hits)})")
 
 
-def excluded_file(f, cat, note):
-    """Replaces a whole test file with a stub that only reports it was excluded."""
-    path = os.path.join(DST, f)
-    write(path, [f"-- STUB[{cat}] excluded file: {note}",
-                 f"print('excluded {f}: {note}')"])
-    log.append(f"{f}: [{cat}] whole file excluded ({note})")
 
 
-def replace_once(f, old, new, cat, note):
-    path = os.path.join(DST, f)
-    text = open(path, encoding="latin-1").read()
-    if text.count(old) != 1:
-        sys.exit(f"{f}: replace target matched {text.count(old)} times")
-    text = text.replace(old, new + f"  -- STUB[{cat}] {note}")
-    open(path, "w", encoding="latin-1").write(text)
-    log.append(f"{f}: [{cat}] {note}")
+
+
+def stub_db():
+    """db.lua tests the debug library almost throughout, so its debug assertions are
+    stubbed section by section; sections that test only ordinary Lua keep running.
+    Blocks are commented out whole (their assertions depend on debug features)."""
+    F = "db.lua"
+    # line hooks (debug.sethook) are not delivered: the trace helper cannot check events
+    stub(F, "  assert(#l == 0)", "debug", "line hook trace helper: no hook events delivered")
+    # getinfo activelines (the 'L' option) is not implemented
+    stmt(F, "assert(b.activelines[b.linedefined + 1] and", "debug", "getinfo activelines (L option)")
+    stmt(F, "assert(not b.activelines[b.linedefined] and", "debug", "getinfo activelines (L option)")
+    block(F, "--  bug in 5.4.4-5.4.6: activelines in vararg functions", "assert(#actl == 0)",
+          "dump", "activelines of a dumped function without debug info", plus=1)
+    block(F, "do   -- testing line info/trace with large gaps in source", "test(s, {1, 2 + i, 2 + i + j",
+          "debug", "line trace (debug.sethook) with large gaps", plus=3)
+    block(F, "do   -- testing active lines", "print'+'", "debug", "activelines (L option)", inclusive=False)
+    stub(F, 'assert(g.what == "Lua" and g.func == f and g.namewhat', "debug", "getinfo namewhat of a function value")
+    # upvalues of C closures are named "" (C closure upvalue names)
+    stub(F, 'assert(debug.getupvalue(string.gmatch("x", "x"), 1) == "")', "debug", "upvalue of a C closure (empty name)")
+    # getlocal / setlocal
+    block(F, "-- invalid levels in [gs]etlocal", "assert(not pcall(debug.setlocal, -1, 1, 10))",
+          "debug", "getlocal/setlocal: levels")
+    block(F, "-- parameter names", "foo(table.unpack(a))", "debug", "getlocal/setlocal: parameter names and varargs")
+    block(F, "do   -- test hook presence in debug info", "_ENV.a = nil", "debug", "hook presence in debug info")
+    stmt(F, "assert(getmetatable(debug.getregistry()._HOOKKEY)", "debug", "hook table weak keys (registry)")
+    # line/call hooks, currentline, C temporaries, global declarations seen by getlocal
+    block(F, "a = {}; local L = nil", "assert(g(0,0) == 30)", "debug",
+          "line/call hooks (debug.sethook), currentline, C temporaries")
+    block(F, "-- minimal tests for setuservalue/getuservalue", "assert(a == nil and not b)", "debug",
+          "setuservalue/getuservalue", plus=1)
+    block(F, "-- testing access to function arguments", "_G.XX = nil", "debug",
+          "call/line hooks and collectlocals")
+    block(F, "-- testing access to local variables in return hook (bug in 5.2)", "  assert(X)", "debug",
+          "return hook access to locals", plus=2)
+    block(F, "do  print(\"testing inspection of parameters/returned values\")", "eqseq(inp, {20}); eqseq(out, {10, 0})",
+          "debug", "inspection of parameters and returned values (hooks)", plus=3)
+    # hooks: count, tail calls, local function information
+    block(F, "-- testing count hooks", "local g, g1", "debug", "count hooks", inclusive=False)
+    block(F, "-- tests for tail calls", "foo(lim)", "debug", "tail call information and hooks")
+    block(F, "-- testing local function information", "assert(a == 2)", "debug", "local function information (hooks)")
+    # traceback
+    block(F, "-- testing traceback", 'assert(st == true and string.find(msg, "pcall"))', "debug",
+          "traceback text and C-function names", plus=1)
+    block(F, "-- testing nparams, nups e isvararg", "assert(t.isvararg == true and t.nparams == 0 and t.nups > 0)",
+          "debug", "getinfo nparams, nups, isvararg")
+    # coroutines
+    block(F, "-- testing debugging of coroutines", "checktraceback(co, {})", "debug",
+          "coroutine traceback and getinfo/getlocal")
+    block(F, "-- check get/setlocal in coroutines", "assert(a and b == 30)", "debug",
+          "getlocal/setlocal in coroutines")
+    block(F, "-- check traceback of suspended", "t[1] = \"'error'\"", "debug",
+          "traceback of suspended and dead coroutines", plus=1)
+    stmt(F, 'assert(type(debug.getregistry()) == "table")', "debug", "debug.getregistry")
+    # tag methods, iterators, finalizers
+    block(F, "-- test tagmethod information", 'assert(~a == "bnot")', "debug", "metamethod names (getinfo)")
+    block(F, "do   -- testing for-iterator name", "for i in f do end", "debug", "for iterator name", plus=1)
+    block(F, "do   -- testing debug info for finalizers", 'assert(name == "__gc")', "debug",
+          "finalizer debug info (getinfo namewhat)", plus=1)
+    block(F, "do", "coroutine.wrap(checkdeep)(d, l)", "debug", "traceback sizes (debug.traceback levels)",
+          plus=4, next_line='print("testing traceback sizes")')
+    # stripped chunks and binary dumps
+    block(F, 'print("testing debug functions on chunk without debug info")', "assert(f() == 13)", "dump",
+          "debug information of stripped chunks (string.dump)")
+    block(F, "do   -- bug in 5.4.0: line hooks in stripped code", "assert(line == nil)", "dump",
+          "line hooks in stripped code", plus=1)
+    block(F, "do   -- tests for 'source' in binary dumps", "debug.getinfo(h).source == '=?')", "dump",
+          "source in binary dumps", plus=1)
 
 
 def main():
@@ -120,8 +204,7 @@ def main():
     stub("vararg.lua", 'assert(m == collectgarbage"count")', "memory", "no allocation check")
     stub("gc.lua", 'collectgarbage("count") <= m + 1', "memory", "everything collected (memory count)")
 
-    # debug library: db.lua tests only the debug library, so the whole file is excluded
-    excluded_file("db.lua", "debug", "whole file tests the debug library")
+    stub_db()
 
     # debug library
     stub("closure.lua", "debug.upvalueid(string.gmatch", "debug", "upvalueid of a C closure")

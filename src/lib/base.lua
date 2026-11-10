@@ -306,8 +306,7 @@ return function(G)
   local function collectgarbage_(opt, ...)
     opt = R.optstring(opt, 1, "collectgarbage", "collect")
     if opt == "count" then
-      local kb = collectgarbage("count")
-      return kb, 0
+      return collectgarbage("count")
     elseif opt == "collect" or opt == "step" or opt == "isrunning" or opt == "stop"
         or opt == "restart" or opt == "incremental" or opt == "generational" then
       return collectgarbage(opt)
