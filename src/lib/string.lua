@@ -454,7 +454,7 @@ local function add_value(ms, buf, s, e, repl, tr)
   local v
   if tr == "function" then
     local caps, n = getcaps(ms, s, e)
-    v = (R.call(repl, unpack(caps, 1, n)))
+    v = (R.ccall(repl, unpack(caps, 1, n)))
   elseif tr == "table" then
     v = R.index(repl, (get_onecapture(ms, 1, s, e)))
   else

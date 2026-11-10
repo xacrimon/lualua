@@ -101,4 +101,4 @@ do
   argv[0] = arg[0]
 end
 main(argv)
-os.exit(0)
+os.exit(0, true)   -- closing the state runs pending finalizers

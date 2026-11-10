@@ -20,13 +20,25 @@ local R = {}
 local type, getmetatable, setmetatable = type, getmetatable, setmetatable
 local tostring, tonumber, next = tostring, tonumber, next
 local mtype, tointeger = math.type, math.tointeger
-local unpack = table.unpack
+local unpack, pack = table.unpack, table.pack
 local error = error
 
 local TableMT = {}      -- host metatable marking Lua tables
 local UserdataMT = {}   -- host metatable marking userdata
 R.TableMT = TableMT
 R.UserdataMT = UserdataMT
+
+-- Variants for objects whose Lua metatable has __gc when it is set: the host
+-- calls __gc (the host finalizer) when the object is collected, and that
+-- calls the Lua finalizer. Lua semantics: the field is checked at setmetatable time.
+local TableGcMT, UserdataGcMT = {}, {}
+local function isTableClass(c) return c == TableMT or c == TableGcMT end
+local function isUserdataClass(c) return c == UserdataMT or c == UserdataGcMT end
+
+-- Error object used to unwind a suspended coroutine that is being closed
+-- (coroutine.close). It is not catchable by pcall and closes variables without
+-- an error argument, as in Lua.
+R.CLOSING = setmetatable({}, { __name = "closing" })
 
 -- Metatables for types other than table/userdata (e.g. typemt.string).
 R.typemt = {}
@@ -80,8 +92,8 @@ local function ltype(v)
   local t = type(v)
   if t == "table" then
     local c = getmetatable(v)
-    if c == TableMT then return "table" end
-    if c == UserdataMT then return "userdata" end
+    if isTableClass(c) then return "table" end
+    if isUserdataClass(c) then return "userdata" end
     error("internal: host table leaked into Lua values")
   end
   return t
@@ -93,7 +105,7 @@ local function getmt(v)
   local t = type(v)
   if t == "table" then
     local c = getmetatable(v)
-    if c == TableMT or c == UserdataMT then return v.mt end
+    if isTableClass(c) or isUserdataClass(c) then return v.mt end
     return nil
   end
   return R.typemt[t]
@@ -120,12 +132,12 @@ end
 R.metamethod = metamethod
 
 local function isTable(v)
-  return type(v) == "table" and getmetatable(v) == TableMT
+  return type(v) == "table" and isTableClass(getmetatable(v))
 end
 R.isTable = isTable
 
 local function isUserdata(v)
-  return type(v) == "table" and getmetatable(v) == UserdataMT
+  return type(v) == "table" and isUserdataClass(getmetatable(v))
 end
 R.isUserdata = isUserdata
 
@@ -149,9 +161,27 @@ local function weakmt(mode)
   return m
 end
 
+-- Runs the Lua finalizer of an object collected by the host.
+local function finalize(o)
+  local mt = o.mt
+  local h = mt and mt.hash.__gc
+  if h ~= nil then
+    -- errors in finalizers are ignored (Lua reports them only as warnings)
+    pcall(R.call, h, o)
+  end
+end
+R.finalize = finalize
+TableGcMT.__gc = finalize
+UserdataGcMT.__gc = finalize
+
 -- Set the Lua metatable of a table or userdata (mt is a Lua table or nil).
 function R.setmetatable(obj, mt)
   obj.mt = mt
+  if mt ~= nil and mt.hash.__gc ~= nil then
+    local c = getmetatable(obj)
+    if c == TableMT then setmetatable(obj, TableGcMT)
+    elseif c == UserdataMT then setmetatable(obj, UserdataGcMT) end
+  end
   if isTable(obj) then
     local mode = mt and mt.hash.__mode
     if type(mode) == "string" and (mode:find("k", 1, true) or mode:find("v", 1, true)) then
@@ -219,6 +249,17 @@ local function call(f, ...)
 end
 R.call = call
 
+-- Calls f from a library function (a C boundary in Lua): the call is not
+-- yieldable, so the coroutine's non-yieldable depth is raised meanwhile.
+function R.ccall(f, ...)
+  local st = R.stack
+  local saved = st.nny or 0
+  st.nny = saved + 1
+  local r = pack(call(f, ...))
+  st.nny = saved
+  return unpack(r, 1, r.n)
+end
+
 -- Like call, but the error message names the called expression `desc`
 -- (for example "global 'print'"). Used by compiled code.
 local function callx(desc, f, ...)
@@ -239,7 +280,7 @@ R.varinfo = varinfo
 local function index(o, k, desc)
   for _ = 1, 2000 do
     local h
-    if type(o) == "table" and getmetatable(o) == TableMT then
+    if type(o) == "table" and isTableClass(getmetatable(o)) then
       local v = o.hash[k]
       if v ~= nil then return v end
       local mt = o.mt
@@ -268,7 +309,7 @@ R.index = index
 local function setindex(o, k, v, desc)
   for _ = 1, 2000 do
     local h
-    if type(o) == "table" and getmetatable(o) == TableMT then
+    if type(o) == "table" and isTableClass(getmetatable(o)) then
       local hash = o.hash
       if hash[k] ~= nil then
         hash[k] = v
@@ -475,7 +516,7 @@ function R.eq(a, b)
   if a == b then return true end
   if type(a) ~= "table" or type(b) ~= "table" then return false end
   local ca, cb = getmetatable(a), getmetatable(b)
-  if (ca ~= TableMT and ca ~= UserdataMT) or (cb ~= TableMT and cb ~= UserdataMT) then
+  if not (isTableClass(ca) or isUserdataClass(ca)) or not (isTableClass(cb) or isUserdataClass(cb)) then
     return false
   end
   local h = metamethod(a, "__eq") or metamethod(b, "__eq")

@@ -58,7 +58,7 @@ local function describe(node)
   return nil
 end
 
-local cexpr, cmulti, compile_args, cblock, compile_proto
+local cexpr, cmulti, compile_args, cblock, compile_proto, clearslots
 
 local function isMulti(node)
   local k = node.k
@@ -561,7 +561,8 @@ S["while"] = function(node)
 end
 
 S["repeat"] = function(node)
-  local body = cblock(node.body)
+  -- the condition sees the body's locals, so they are cleared after it
+  local body, slots = cblock(node.body, true)
   local cond = cexpr(node.cond)
   return function(A)
     repeat
@@ -570,7 +571,9 @@ S["repeat"] = function(node)
         if sig == BREAK then break end
         return sig, val
       end
-    until truthy(cond(A))
+      local done = truthy(cond(A))
+      clearslots(A, slots)
+    until done
   end
 end
 
@@ -827,9 +830,13 @@ local function closeall(list, err)
       -- the metamethod was removed after the variable was declared
       ok, e2 = false, R.where(1) .. "attempt to call a nil value (metamethod 'close')"
     elseif err == nil then
-      -- like Lua, the error object is passed only when closing because of an error
+      -- normal exit: the handler may yield
       ok, e2 = pcall(R.call, h, v)
+    elseif err == R.CLOSING then
+      -- unwinding for coroutine.close: not yieldable, and no error object
+      ok, e2 = pcall(R.ccall, h, v)
     else
+      -- closing because of an error (recovered by pcall): the handler may yield
       ok, e2 = pcall(R.call, h, v, err)
     end
     if not ok then err = e2 end
@@ -838,7 +845,14 @@ local function closeall(list, err)
 end
 
 -- Compiles a block (a list of statements) into a runner f(A) -> sig, val.
-cblock = function(block)
+-- Clears the slots of block-local variables when the block exits. Activation
+-- records would otherwise keep dead values alive (Lua's collector ignores dead
+-- registers), which weak tables and finalizers would observe.
+clearslots = function(A, slots)
+  for i = 1, #slots do A[slots[i]] = nil end
+end
+
+cblock = function(block, noclear)
   local stats = block.stats
   local n = #stats
   local fns, lines = {}, {}
@@ -883,6 +897,27 @@ cblock = function(block)
     end
   end
 
+  -- slots declared directly in this block (and loop variables of its loops)
+  local declared = {}
+  for _, st in ipairs(stats) do
+    if st.k == "local" then
+      for _, vi in ipairs(st.vars) do declared[#declared + 1] = vi.slot end
+    elseif st.k == "localfunc" then
+      declared[#declared + 1] = st.var.slot
+    elseif st.k == "numfor" then
+      declared[#declared + 1] = st.var.slot
+    elseif st.k == "genfor" then
+      for _, vi in ipairs(st.vars) do declared[#declared + 1] = vi.slot end
+    end
+  end
+  if #declared > 0 and not noclear then
+    local inner = run
+    run = function(A)
+      local sig, val = inner(A)
+      clearslots(A, declared)
+      return sig, val
+    end
+  end
   if hasclose then
     local inner = run
     run = function(A)
@@ -899,7 +934,7 @@ cblock = function(block)
       error(err, 0)
     end
   end
-  return run
+  return run, declared
 end
 
 ---------------------------------------------------------------------------

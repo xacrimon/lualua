@@ -11,6 +11,10 @@ local pack, unpack = table.pack, table.unpack
 return function(G)
   -- frame stacks of coroutines, keyed by the host coroutine
   local stacks = setmetatable({}, { __mode = "k" })
+  -- coroutines that have been resumed at least once
+  local started = setmetatable({}, { __mode = "k" })
+  -- coroutines that have been closed (their error, if any, was reported)
+  local closed = setmetatable({}, { __mode = "k" })
 
   local function checkco(co, n, fname)
     if type(co) ~= "thread" then R.typeerror(n, fname, "coroutine", co) end
@@ -19,13 +23,20 @@ return function(G)
 
   local function create(f)
     R.checkfunction(f, 1, "create")
-    local co = cocreate(function(...) return R.call(f, ...) end)
+    local co = cocreate(function(...)
+      local r = pack(pcall(R.call, f, ...))
+      if r[1] then return unpack(r, 2, r.n) end
+      -- closed by coroutine.close (from inside): the coroutine ends normally
+      if r[2] == R.CLOSING then return end
+      error(r[2], 0)
+    end)
     stacks[co] = { n = 0 }
     return co
   end
 
   -- Resumes co on its own frame stack. Returns the host results.
   local function resume_raw(co, ...)
+    started[co] = true
     local saved = R.stack
     local st = stacks[co]
     if st == nil then st = { n = 0 }; stacks[co] = st end
@@ -42,7 +53,13 @@ return function(G)
   end
 
   local function yield(...)
-    return coyield(...)
+    if (R.stack.nny or 0) > 0 then
+      R.rterror("attempt to yield across a C-call boundary")
+    end
+    local r = pack(coyield(...))
+    -- resumed by coroutine.close: unwind the coroutine (running its __close handlers)
+    if r[1] == R.CLOSING and r.n == 1 then R.throw(R.CLOSING) end
+    return unpack(r, 1, r.n)
   end
 
   local function status(co)
@@ -55,9 +72,12 @@ return function(G)
   end
 
   local function isyieldable(co)
-    if co == nil then return coisyieldable() end
+    if co == nil then
+      return coisyieldable() and not ((R.stack.nny or 0) > 0)
+    end
     checkco(co, 1, "isyieldable")
-    return coisyieldable(co)
+    local st = stacks[co]
+    return coisyieldable(co) and not (st and (st.nny or 0) > 0)
   end
 
   local function wrap(f)
@@ -76,14 +96,28 @@ return function(G)
   local mainthread = corunning()
 
   local function close(co)
+    if co == nil then co = corunning() end   -- default: the running coroutine
     checkco(co, 1, "close")
     local st = costatus(co)
+    if st == "dead" and closed[co] then return true end   -- after closing, no more errors
+    if st == "suspended" and started[co] then
+      -- unwind the suspended coroutine so its pending __close handlers run
+      local r = resume_raw(co, R.CLOSING)
+      closed[co] = true
+      if r[1] or r[2] == R.CLOSING then return true end
+      return false, r[2]
+    end
     if st == "suspended" or st == "dead" then
       local ok, err = coclose(co)
+      closed[co] = true
       if not ok then return false, err end
       return true
     end
-    if st == "running" and co == mainthread then R.rterror("cannot close main thread") end
+    if st == "running" then
+      if co == mainthread then R.rterror("cannot close main thread") end
+      -- a coroutine closing itself unwinds (running its pending __close handlers)
+      R.throw(R.CLOSING)
+    end
     R.rterror("cannot close a " .. st .. " coroutine")
   end
 

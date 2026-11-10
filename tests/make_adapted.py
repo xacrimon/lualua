@@ -123,6 +123,9 @@ def main():
           "debug", "light userdata via debug.setuservalue")
 
     comment_all("locals.lua", "assert(debug.getinfo(2).name", "debug", "getinfo name of calling function")
+    comment_all("coroutine.lua", 'assert(X == 43 and Y.what == "C")', "debug", "getinfo what of a C frame")
+    block("coroutine.lua", "local function dotrace (event)", "assert(v == correcttrace[k])",
+          "debug", "debug.sethook trace of a coroutine", plus=1)
     comment_all("locals.lua", "in metamethod 'close'", "debug", "traceback text")
     block("locals.lua", "-- '__close' vs. return hooks in C functions", "checktable(t, {10, 20})",
           "debug", "hooks (debug.sethook) and T.testC")

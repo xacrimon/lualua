@@ -166,12 +166,14 @@ return function(G)
   local function pcall_(f, ...)
     local st = R.stack
     local n = st.n
-    local savednat = st.nat
+    local savednat, savednny = st.nat, st.nny
     if FUPS[f] == nil then st.nat = n end   -- a native called directly by pcall
     local r = pack(pcall(R.call, f, ...))
     st.nat = savednat
+    st.nny = savednny
     if not r[1] then
       st.n = n
+      if r[2] == R.CLOSING then error(R.CLOSING, 0) end   -- not catchable here
     end
     return unpack(r, 1, r.n)
   end
@@ -179,11 +181,13 @@ return function(G)
   local function xpcall_(f, handler, ...)
     local st = R.stack
     local n = st.n
-    local savednat = st.nat
+    local savednat, savednny = st.nat, st.nny
     if FUPS[f] == nil then st.nat = n end
     local r = pack(pcall(R.call, f, ...))
     st.nat = savednat
+    st.nny = savednny
     if r[1] then return unpack(r, 1, r.n) end
+    if r[2] == R.CLOSING then error(R.CLOSING, 0) end   -- not catchable here
     st.n = n
     local hr = pack(pcall(R.call, handler, r[2]))
     st.n = n

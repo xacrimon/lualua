@@ -1,3 +1,4 @@
+local pack, unpack = table.pack, table.unpack
 -- table.lua: table library, following ltablib.c (Lua 5.5).
 -- Element access goes through R.index / R.setindex / R.len so that
 -- __index, __newindex and __len are honoured.
@@ -253,7 +254,15 @@ return function(G)
     move = tmove,
     pack = tpack,
     remove = tremove,
-    sort = tsort,
+    sort = function(...)
+      -- the comparator and metamethods run from a C boundary: not yieldable
+      local st = R.stack
+      local saved = st.nny or 0
+      st.nny = saved + 1
+      local r = pack(tsort(...))
+      st.nny = saved
+      return unpack(r, 1, r.n)
+    end,
     unpack = tunpack,
   })
   G.hash.table = lib
