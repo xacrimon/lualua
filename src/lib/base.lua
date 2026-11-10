@@ -188,13 +188,16 @@ return function(G)
 
   -- Runs the message handler. An error inside the handler is handled by the
   -- handler again (as Lua does); after too many nested errors the C stack is "full".
+  -- At the C-call limit the handler gets "C stack overflow"; well past it
+  -- the result is "error in error handling" (as in ldo.c).
   local MAXHANDLER = 200
   local function runhandler(handler, err, n, depth)
     local st = R.stack
     st.n = n
+    if depth == MAXHANDLER then err = "C stack overflow" end
     local hr = pack(pcall(R.call, handler, err))
     if hr[1] then return hr[2] end
-    if depth >= MAXHANDLER then return "C stack overflow" end
+    if depth >= MAXHANDLER + 20 then return "error in error handling" end
     return runhandler(handler, hr[2], n, depth + 1)
   end
 
