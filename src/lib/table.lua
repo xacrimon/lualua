@@ -34,10 +34,15 @@ local function getn(t, n, fname, what)
   return l
 end
 
+local MAXHSIZE = 1 << 30   -- largest hash part (ltable.c)
+
 local function tcreate(sizeseq, sizerest)
   local a = R.checkinteger(sizeseq, 1, "create")
-  R.optinteger(sizerest, 2, "create", 0)
+  local b = R.optinteger(sizerest, 2, "create", 0)
+  -- sizes are unsigned in ltablib.c: negative values are out of range too
   if a < 0 or a > INT_MAX then R.argerror(1, "create", "out of range") end
+  if b < 0 or b > INT_MAX then R.argerror(2, "create", "out of range") end
+  if b > MAXHSIZE then R.rterror("table overflow") end
   return R.newtable()
 end
 

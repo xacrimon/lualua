@@ -743,7 +743,7 @@ end
 S["return"] = function(node)
   local exprs = node.exprs
   local n = #exprs
-  if n == 1 and (exprs[1].k == "call" or exprs[1].k == "method") then
+  if n == 1 and not node.notail and (exprs[1].k == "call" or exprs[1].k == "method") then
     local c = exprs[1]
     local argsf = compile_args(c.args)
     if c.k == "call" then
@@ -822,13 +822,17 @@ local function closeall(list, err)
   for i = #list, 1, -1 do
     local v = list[i]
     local h = R.metamethod(v, "__close")
-    if h ~= nil then
+    local ok, e2
+    if h == nil then
+      -- the metamethod was removed after the variable was declared
+      ok, e2 = false, R.where(1) .. "attempt to call a nil value (metamethod 'close')"
+    elseif err == nil then
       -- like Lua, the error object is passed only when closing because of an error
-      local ok, e2
-      if err == nil then ok, e2 = pcall(R.call, h, v)
-      else ok, e2 = pcall(R.call, h, v, err) end
-      if not ok then err = e2 end
+      ok, e2 = pcall(R.call, h, v)
+    else
+      ok, e2 = pcall(R.call, h, v, err)
     end
+    if not ok then err = e2 end
   end
   return err
 end

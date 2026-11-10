@@ -47,18 +47,35 @@ def stub(f, fragment, cat, note, nth=None):
     log.append(f"{f}: [{cat}] {note}")
 
 
-def block(f, start, end, cat, note, plus=0):
-    """Comments out lines from the line containing start up to (not including) the line containing end."""
+def block(f, start, end, cat, note, plus=0, inclusive=True):
+    """Comments out lines from the line containing start to the line containing end
+    (inclusive by default; the end line is the last line of the statement)."""
     path = os.path.join(DST, f)
     lines = read(path)
     s = [i for i, l in enumerate(lines) if start in l]
     e = [i for i, l in enumerate(lines) if end in l]
     if len(s) != 1 or len(e) != 1 or e[0] <= s[0]:
         sys.exit(f"{f}: block markers not unique/ordered: {len(s)} {len(e)}")
-    for j in range(s[0], min(e[0] + plus, len(lines))):
+    stop = e[0] + (1 if inclusive else 0) + plus
+    for j in range(s[0], min(stop, len(lines))):
         lines[j] = "-- STUB[" + cat + "] " + lines[j]
     write(path, lines)
-    log.append(f"{f}: [{cat}] {note} (lines {s[0]+1}-{e[0]+plus})")
+    log.append(f"{f}: [{cat}] {note} (lines {s[0]+1}-{stop})")
+
+
+def comment_all(f, fragment, cat, note):
+    """Comments out every line containing fragment (for one-line statements)."""
+    path = os.path.join(DST, f)
+    lines = read(path)
+    hits = [i for i, l in enumerate(lines) if fragment in l]
+    if not hits:
+        sys.exit(f"{f}: fragment {fragment!r} matched no lines")
+    for i in hits:
+        if lines[i].count("(") != lines[i].count(")"):
+            sys.exit(f"{f}:{i+1}: not a balanced one-line statement: {lines[i]!r}")
+        lines[i] = "-- STUB[" + cat + "] " + lines[i]
+    write(path, lines)
+    log.append(f"{f}: [{cat}] {note} (lines {', '.join(str(i+1) for i in hits)})")
 
 
 def replace_once(f, old, new, cat, note):
@@ -77,7 +94,12 @@ def main():
     shutil.copytree(SRC, DST)
     for f in glob.glob(os.path.join(DST, "*.lua")):
         s = open(f, encoding="latin-1").read()
-        open(f, "w", encoding="latin-1").write(PRELUDE + s)
+        if s.startswith("#"):
+            # keep a shebang line first (the loader skips it only at the start of a file)
+            first, _, rest = s.partition("\n")
+            open(f, "w", encoding="latin-1").write(first + "\n" + PRELUDE + rest)
+        else:
+            open(f, "w", encoding="latin-1").write(PRELUDE + s)
 
     # pointer identity
     stub("pm.lua", 'string.format("%p", s) ~= string.format("%p", r)', "pointer", "%p address comparison")
@@ -100,19 +122,28 @@ def main():
     block("errors.lua", "-- passing light userdata instead of full userdata", '"light userdata")',
           "debug", "light userdata via debug.setuservalue")
 
+    comment_all("locals.lua", "assert(debug.getinfo(2).name", "debug", "getinfo name of calling function")
+    comment_all("locals.lua", "in metamethod 'close'", "debug", "traceback text")
+    block("locals.lua", "-- '__close' vs. return hooks in C functions", "checktable(t, {10, 20})",
+          "debug", "hooks (debug.sethook) and T.testC")
+    comment_all("locals.lua", "debug.getlocal(2", "debug", "getlocal inside a __close handler")
+    comment_all("locals.lua", 'assert(res[1] == "x" and res[2] == "i"', "debug", "getlocal results")
+    block("locals.lua", "-- '__close' vs. return hooks in Lua functions", '"return close", "return foo"})',
+          "debug", "hooks (debug.sethook) in Lua functions", plus=1)
+
     # string.dump and binary chunks
     block("calls.lua", "-- another small bug (in 5.2.1)", 'assert(type(f) == "function" and f() == 1)',
           "dump", "string.dump and binary chunk load")
     block("calls.lua", "do   -- another bug (in 5.4.0)", 'print("testing binary chunks")',
-          "dump", "string.dump / binary chunk section")
+          "dump", "string.dump / binary chunk section", inclusive=False)
     block("calls.lua", 'print("testing binary chunks")', "print('OK')",
-          "dump", "binary chunk tests to end of file")
+          "dump", "binary chunk tests to end of file", inclusive=False)
     block("db.lua", "--  without debug information", "assert(#actl == 0)   -- no line info",
-          "dump", "string.dump of stripped code", plus=2)
+          "dump", "string.dump of stripped code", plus=1)
     block("db.lua", "-- dump/load a function without debug info", 'print"OK"',
-          "dump", "string.dump / stripped debug info section")
+          "dump", "string.dump / stripped debug info section", inclusive=False)
     block("errors.lua", "-- errors in functions without debug info", "-- tests for field accesses after RK limit",
-          "dump", "string.dump of stripped functions")
+          "dump", "string.dump of stripped functions", inclusive=False)
 
     os.makedirs(OUT, exist_ok=True)
     with open(LOG, "w", encoding="latin-1") as fh:

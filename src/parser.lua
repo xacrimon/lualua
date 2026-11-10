@@ -132,10 +132,15 @@ local function closeblock(b)
   fs.block = b.parent
 end
 
+-- Finds the visible declaration of name in function state f: a local VarInfo,
+-- the string "global" if a global declaration (pseudo entry) is nearer, or nil.
 local function findlocal(f, name)
   local av = f.actvars
   for i = #av, 1, -1 do
-    if av[i].name == name then return av[i] end
+    if av[i].name == name then
+      if av[i].pseudo then return "global" end
+      return av[i]
+    end
   end
   return nil
 end
@@ -149,6 +154,7 @@ local function findupval(f, name)
   local p = f.parent
   if p == nil then return nil end
   local vi = findlocal(p, name)
+  if vi == "global" then return nil end
   if vi then
     vi.captured = true
     f.upvals[#f.upvals + 1] = { name = name, instack = true, slot = vi.slot, var = vi }
@@ -183,12 +189,19 @@ end
 -- Resolves a name in the current scope to an expression node.
 local function singlevar(name, line)
   local vi = findlocal(fs, name)
-  if vi then return { k = "local", var = vi, name = name } end
-  local ui = findupval(fs, name)
+  if vi and vi ~= "global" then return { k = "local", var = vi, name = name } end
+  local ui = (vi == nil) and findupval(fs, name) or nil
   if ui then return { k = "upval", idx = ui, name = name } end
   -- a global
   local attrib = globalattrib(name, line)
-  local env = singlevar("_ENV", line)
+  -- _ENV declared by a global statement is itself a global: globals cannot use it
+  for _, e in ipairs(gdecls) do
+    if name ~= "_ENV" and not e.implicit and e.names["_ENV"] ~= nil then
+      errorat("_ENV is global when accessing variable '" .. name .. "'", line)
+    end
+  end
+  -- (a free _ENV cannot be looked up in itself)
+  local env = (name == "_ENV") and { k = "nil" } or singlevar("_ENV", line)
   return { k = "index", obj = env, key = { k = "str", v = name }, gname = name,
            attrib = attrib, line = line }
 end
@@ -435,12 +448,20 @@ local function localstat(line)
 end
 
 -- Global declaration statement: 'global' [attrib] '*' | 'global' [attrib] namelist ['=' explist]
+-- Declared global names are scope entries like locals (for goto checks), so
+-- each gets a pseudo entry; '*' names the collective declaration.
+local function pseudoscope(name)
+  activate({ name = name, attrib = nil, slot = 0, captured = false, pseudo = true })
+end
+
 local function globalstat(line)
   local prefix = attrib()
+  if prefix == "close" then errorat("global variables cannot be to-be-closed", line) end
   if ls.t == "*" then
     ls:advance()
     local entry = { all = true, attrib = prefix, names = {} }
     gdecls[#gdecls + 1] = entry
+    pseudoscope("*")
     return { k = "nop" }
   end
   local names = {}
@@ -448,6 +469,7 @@ local function globalstat(line)
   repeat
     local name = checkname()
     local at = attrib()
+    if at == "close" then errorat("global variables cannot be to-be-closed", line) end
     namelist[#namelist + 1] = name
     names[name] = at or prefix or false
   until not testnext(",")
@@ -458,6 +480,7 @@ local function globalstat(line)
   end
   -- declaration is in scope after the statement
   gdecls[#gdecls + 1] = entry
+  for _, name in ipairs(namelist) do pseudoscope(name) end
   return { k = "globaldecl", names = namelist, attribs = names, exprs = exprs or {},
            env = singlevar("_ENV", line), line = line }
 end
@@ -539,7 +562,12 @@ local function retstat(line)
     exprs = explist()
   end
   testnext(";")
-  return { k = "return", exprs = exprs, line = line }
+  -- a return inside the scope of a to-be-closed variable is not a tail call
+  local notail = (fs.genfor or 0) > 0
+  for _, vi in ipairs(fs.actvars) do
+    if vi.attrib == "close" then notail = true end
+  end
+  return { k = "return", exprs = exprs, line = line, notail = notail }
 end
 
 local function ifstat(line)
@@ -605,7 +633,10 @@ local function forstat(line)
       vars[i] = newvarinfo(n, i == 1 and "const" or nil)
     end
     for _, vi in ipairs(vars) do activate(vi) end
+    -- the loop's fourth value is a to-be-closed value: returns inside are not tail calls
+    fs.genfor = (fs.genfor or 0) + 1
     local stats = statlist()
+    fs.genfor = fs.genfor - 1
     b.stats = stats
     closeblock(b)
     local body = { k = "block", stats = stats, labels = b.labels }
@@ -667,7 +698,10 @@ local function statement()
     return funcname_stat(line)
   elseif t == "local" then
     return localstat_entry(line)
-  elseif t == "global" then
+  elseif t == "name" and ls.v == "global" and
+         (ls:lookahead() == "name" or ls:lookahead() == "*" or ls:lookahead() == "<"
+          or ls:lookahead() == "function") then
+    -- 'global' starts a declaration only when a name, '*', '<' or 'function' follows
     ls:advance()
     if ls.t == "function" then
       ls:advance()
@@ -685,6 +719,7 @@ local function statement()
         end
       end
       gdecls[#gdecls + 1] = { all = false, names = { [name] = false } }
+      pseudoscope(name)   -- the name now refers to the global, even over a local
       local f = funcbody(false, line, name)
       return { k = "assign", targets = { singlevar(name, line) }, exprs = { { k = "func", f = f, line = line } }, line = line }
     end

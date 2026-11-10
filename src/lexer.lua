@@ -17,7 +17,8 @@ local sbyte, ssub, schar, sfind = string.byte, string.sub, string.char, string.f
 local concat = table.concat
 
 local KEYWORDS = {}
-for w in ([[and break do else elseif end false for function global goto if in
+-- 'global' is a contextual keyword (see parser.lua), so it is a plain name here
+for w in ([[and break do else elseif end false for function goto if in
   local nil not or repeat return then true until while]]):gmatch("%S+") do
   KEYWORDS[w] = true
 end

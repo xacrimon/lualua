@@ -1,7 +1,7 @@
 #!/bin/sh
 # Prints the first failing location (assertion or error) for suite files.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-TESTES=${TESTES:-/home/acrimon/work/lua/testes}
+TESTES=${TESTES:-$ROOT/tests/adapted/testes}
 for f in "$@"; do
   out=$(cd "$TESTES" && LUALUA_DEBUG=1 timeout 60 lua "$ROOT/lualua.lua" -e "_port=true;_soft=true;_nomsg=true" "$f" 2>&1)
   rc=$?
