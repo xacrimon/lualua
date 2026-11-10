@@ -116,7 +116,11 @@ local function closeblock(b)
     end
   end
   if b.parent then
-    for _, g in ipairs(b.gotos) do table.insert(b.parent.gotos, g) end
+    -- pending gotos leave this block: they only see the locals of the enclosing block
+    for _, g in ipairs(b.gotos) do
+      g.nactive = b.nactive
+      table.insert(b.parent.gotos, g)
+    end
   else
     if #b.gotos > 0 then
       local g = b.gotos[1]
@@ -160,7 +164,7 @@ end
 
 -- Global-declaration check for a free name. Returns the attribute ("const" or nil)
 -- or raises "not declared".
-local function globalattrib(name, line)
+local function globalattrib(name, line, nothrow)
   local explicit = false
   for _, e in ipairs(gdecls) do
     if not e.implicit then explicit = true break end
@@ -172,6 +176,7 @@ local function globalattrib(name, line)
       if e.names[name] ~= nil then return e.names[name] or nil end
     end
   end
+  if nothrow then return nil end
   errorat("variable '" .. name .. "' not declared", line)
 end
 
@@ -321,7 +326,7 @@ local function simpleexp()
       syntaxerror("cannot use '...' outside a vararg function")
     end
     ls:advance()
-    return { k = "vararg", line = line }
+    return { k = "vararg", line = line, var = fs.varvar }
   elseif t == "{" then
     return tablecons()
   elseif t == "function" then
@@ -457,6 +462,8 @@ local function globalstat(line)
            env = singlevar("_ENV", line), line = line }
 end
 
+local checkassignable   -- defined with the expression statements below
+
 local function funcname_stat(line)
   -- funcname: Name {'.' Name} [':' Name]
   local name = checkname()
@@ -476,8 +483,34 @@ local function funcname_stat(line)
     target = { k = "index", obj = target, key = { k = "str", v = key }, line = line }
     ismethod = true
   end
+  checkassignable({ target }, line)
   local f = funcbody(ismethod, line, fullname)
   return { k = "assign", targets = { target }, exprs = { { k = "func", f = f, line = line } }, line = line }
+end
+
+-- Rejects assignments to read-only variables (const/close locals and
+-- upvalues, and const globals) and to non-assignable expressions.
+checkassignable = function(targets, line)
+  for _, t in ipairs(targets) do
+    if t.k ~= "local" and t.k ~= "upval" and t.k ~= "index" then
+      syntaxerror("syntax error")
+    end
+    if t.k == "local" and t.var.attrib then
+      errorat("attempt to assign to const variable '" .. t.var.name .. "'", line)
+    elseif t.k == "upval" then
+      -- an upvalue refers to the nearest enclosing local of that name
+      local f, found = fs.parent, nil
+      while f and not found do
+        found = findlocal(f, t.name)
+        f = f.parent
+      end
+      if found and found.attrib then
+        errorat("attempt to assign to const variable '" .. t.name .. "'", line)
+      end
+    elseif t.k == "index" and t.attrib then
+      errorat("attempt to assign to const variable '" .. t.gname .. "'", line)
+    end
+  end
 end
 
 local function exprstat(line)
@@ -489,26 +522,7 @@ local function exprstat(line)
     end
     checknext("=")
     local exprs = explist()
-    for _, t in ipairs(targets) do
-      if t.k ~= "local" and t.k ~= "upval" and t.k ~= "index" then
-        syntaxerror("syntax error")
-      end
-      if t.k == "local" and t.var.attrib then
-        errorat("attempt to assign to const variable '" .. t.var.name .. "'", line)
-      elseif t.k == "upval" then
-        -- an upvalue refers to the nearest enclosing local of that name
-        local f, found = fs.parent, nil
-        while f and not found do
-          found = findlocal(f, t.name)
-          f = f.parent
-        end
-        if found and found.attrib then
-          errorat("attempt to assign to const variable '" .. t.name .. "'", line)
-        end
-      elseif t.k == "index" and t.attrib then
-        errorat("attempt to assign to const variable '" .. t.gname .. "'", line)
-      end
-    end
+    checkassignable(targets, line)
     return { k = "assign", targets = targets, exprs = exprs, line = line }
   end
   -- must be a function call
@@ -604,6 +618,7 @@ end
 local function repeatstat(line)
   ls:advance()
   local b = openblock(true)
+  b.isrepeat = true
   local stats = statlist()
   b.stats = stats
   checkmatch("until", "repeat", line)
@@ -657,6 +672,9 @@ local function statement()
     if ls.t == "function" then
       ls:advance()
       local name = checkname()
+      -- a name already declared const cannot be defined by a function statement
+      local attrib = globalattrib(name, line, true)
+      if attrib then errorat("attempt to assign to const variable '" .. name .. "'", line) end
       gdecls[#gdecls + 1] = { all = false, names = { [name] = false } }
       local f = funcbody(false, line, name)
       return { k = "assign", targets = { singlevar(name, line) }, exprs = { { k = "func", f = f, line = line } }, line = line }
@@ -667,11 +685,17 @@ local function statement()
     local name = checkname()
     checknext("::")
     local b = fs.block
-    if b.labels[name] then
-      errorat("label '" .. name .. "' already defined", line)
+    -- a label may not repeat a name visible from its own or an enclosing block
+    local bb = b
+    while bb do
+      if bb.labels[name] then
+        errorat("label '" .. name .. "' already defined", line)
+      end
+      bb = bb.parent
     end
     b.labels[name] = true
-    return { k = "label", name = name, line = line }
+    while ls.t == ";" do ls:advance() end   -- void statements do not count
+    return { k = "label", name = name, line = line, nact = #fs.actvars }
   elseif t == "return" then
     return retstat(line)
   elseif t == "break" then
@@ -681,10 +705,32 @@ local function statement()
     ls:advance()
     local name = checkname()
     local b = fs.block
-    b.gotos[#b.gotos + 1] = { name = name, line = line }
+    b.gotos[#b.gotos + 1] = { name = name, line = line, nactive = #fs.actvars }
     return { k = "goto", name = name, line = line }
   end
   return exprstat(line)
+end
+
+-- Checks that no pending forward goto jumps into the scope of a local.
+-- A label followed only by labels (void statements) at the end of its block
+-- sees the locals of the block's start only.
+local function checklabels(stats, b)
+  for i, s in ipairs(stats) do
+    if s.k == "label" then
+      -- (not for repeat-until bodies: the condition sees the body's locals)
+      local atend = not b.isrepeat
+      for j = i + 1, #stats do
+        if stats[j].k ~= "label" then atend = false break end
+      end
+      local nact = atend and b.nactive or s.nact
+      for _, g in ipairs(b.gotos) do
+        if g.name == s.name and g.nactive < nact then
+          errorat("<goto " .. s.name .. "> at line " .. g.line ..
+                  " jumps into the scope of '" .. fs.actvars[g.nactive + 1].name .. "'", g.line)
+        end
+      end
+    end
+  end
 end
 
 statlist = function()
@@ -697,6 +743,7 @@ statlist = function()
     local s = statement()
     if s.k ~= "nop" then stats[#stats + 1] = s end
   end
+  checklabels(stats, fs.block)
   return stats
 end
 
@@ -744,6 +791,7 @@ funcbody = function(ismethod, line, name)
     until not testnext(",")
   end
   newf.isvararg = isvararg
+  newf.varvar = varvar
   checknext(")")
   local stats = statlist()
   b.stats = stats

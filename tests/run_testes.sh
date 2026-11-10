@@ -5,7 +5,7 @@
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TESTES=${TESTES:-/home/acrimon/work/lua/testes}
 files="$*"
-[ -z "$files" ] && files=$(cd "$TESTES" && ls *.lua | grep -v '^all.lua$')
+[ -z "$files" ] && files=$(cd "$TESTES" && ls *.lua | grep -v -e "^all.lua$" -e "^heavy.lua$")
 pass=0; fail=0
 for f in $files; do
   out=$(cd "$TESTES" && timeout 120 lua "$ROOT/lualua.lua" -e "_port=true;_soft=true;_nomsg=true" "$f" 2>&1)

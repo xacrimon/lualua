@@ -32,6 +32,9 @@ local truthy = R.truthy
 local rawset = R.rawset
 
 local MAXDEPTH = 195000
+-- closure -> its upvalue cells; the cell array also carries .names (upvalue names)
+local FUPS = setmetatable({}, { __mode = "k" })
+C.FUPS = FUPS
 local CURSRC = "?"   -- chunk name of the chunk being compiled
 
 -- Description of an expression for error messages ("local 'x'", ...).
@@ -83,7 +86,15 @@ E.upval = function(node)
   return function(A) return A.up[i].v end
 end
 
-E.vararg = function()
+E.vararg = function(node)
+  if node.var then
+    -- named vararg (...name): the variable holds the extra arguments
+    local s, cap = node.var.slot, node.var.captured
+    return function(A)
+      local t = cap and A[s].v or A[s]
+      return t.hash[1]
+    end
+  end
   return function(A) return A.va[1] end
 end
 
@@ -305,6 +316,13 @@ end
 cmulti = function(node)
   local k = node.k
   if k == "vararg" then
+    if node.var then
+      local s, cap = node.var.slot, node.var.captured
+      return function(A)
+        local t = cap and A[s].v or A[s]
+        return unpack(t.hash, 1, t.hash.n)
+      end
+    end
     return function(A)
       local va = A.va
       return unpack(va, 1, va.n)
@@ -870,7 +888,10 @@ compile_proto = function(proto)
   for i, vi in ipairs(proto.params) do
     params[i] = { slot = vi.slot, cap = vi.captured }
   end
+  local upnames = {}
+  for i, u in ipairs(proto.upvals) do upnames[i] = u.name end
   local c = {
+    upnames = upnames,
     src = CURSRC,
     line = proto.line,
     params = params,
@@ -892,7 +913,8 @@ function C.newlua(c, ups)
   local run, params, np, isvararg = c.run, c.params, c.np, c.isvararg
   local src, line = c.src, c.line
   local varslot, varcap = c.varslot, c.varcap
-  return function(...)
+  ups.names = c.upnames
+  local fn = function(...)
     local A = { up = ups, src = src, line = line }
     if np > 0 then
       local args = { ... }
@@ -934,6 +956,8 @@ function C.newlua(c, ups)
     end
     return
   end
+  FUPS[fn] = ups
+  return fn
 end
 
 -- Compiles a parsed chunk (proto) and returns a Lua function whose

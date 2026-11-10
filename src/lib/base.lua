@@ -27,9 +27,11 @@ return function(G)
     return R.tostring((...))
   end
 
-  local function tonumber_(v, base, ...)
+  local function tonumber_(...)
+    local nargs = select("#", ...)
+    local v, base = ...
+    if nargs == 0 then R.argerror(1, "tonumber", "value expected") end
     if base == nil then
-      if select("#", v, base, ...) == 0 then R.argerror(1, "tonumber", "value expected") end
       return R.tonumber(v)
     end
     base = R.checkinteger(base, 2, "tonumber")
@@ -151,6 +153,7 @@ return function(G)
   end
 
   local function error_(msg, level)
+    if msg == nil then R.throw("<no error object>") end
     level = R.optinteger(level, 2, "error", 1)
     if type(msg) == "string" and level > 0 then
       msg = R.where(level) .. msg
@@ -247,6 +250,8 @@ return function(G)
     return f()
   end
 
+  local gcparams = { pause = 200, stepmul = 100, stepsize = 13, minormul = 20, majormul = 100 }
+  local gcmode = "incremental"
   local function collectgarbage_(opt, ...)
     opt = R.optstring(opt, 1, "collectgarbage", "collect")
     if opt == "count" then
@@ -256,7 +261,16 @@ return function(G)
         or opt == "restart" or opt == "incremental" or opt == "generational" then
       return collectgarbage(opt)
     elseif opt == "param" then
-      return 0
+      -- collector parameters: stored and returned, not used
+      local name = R.optstring(select(1, ...), 2, "collectgarbage", nil)
+      local value = select(2, ...)
+      local old = gcparams[name or "pause"] or 0
+      if name ~= nil and value ~= nil then gcparams[name] = value end
+      return old
+    elseif opt == "incremental" or opt == "generational" then
+      local old = gcmode
+      gcmode = opt
+      return old
     end
     R.argerror(1, "collectgarbage", "invalid option '" .. opt .. "'")
   end
@@ -300,6 +314,14 @@ return function(G)
       tried[#tried + 1] = "\n\tno file '" .. candidate .. "'"
     end
     return nil, table.concat(tried)
+  end
+
+  package.hash.searchpath = function(name, path)
+    name = R.checkstring(name, 1, "searchpath")
+    path = R.checkstring(path, 2, "searchpath")
+    local file, tried = searchpath(name, path)
+    if file then return file end
+    return nil, tried
   end
 
   local function require_(name)

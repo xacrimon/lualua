@@ -1,8 +1,8 @@
 -- lib/string.lua: the Lua 5.5 string library, installed as G.hash.string.
--- Lua patterns, string.format and string.pack/unpack are implemented here.
--- Host primitives are used only as building blocks: string.byte/char/sub/
--- format, math.type/tointeger/floor/log/ult-free arithmetic, table.concat/
--- unpack, select, tostring.
+-- Lua patterns, string.format and string.pack/unpack/packsize are implemented
+-- here. Host primitives are used only as building blocks: string.byte/char/
+-- sub/format, math.type/tointeger/floor/log, table.concat/unpack, select,
+-- tostring, and the host string.pack once, to probe native endianness.
 
 local R = require("runtime")
 
