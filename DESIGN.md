@@ -163,8 +163,9 @@ Known gaps that remain (not excluded):
   `__tostring`, `load`'s reader, ...) let a yield through where the reference
   raises "attempt to yield across a C-call boundary".
 - Finalizers run from the host collector, so their timing and order are the
-  host's, not the reference's. An error inside `__gc` is discarded; the
-  reference reports it as a warning.
+  host's, not the reference's. An error inside `__gc` is discarded. The
+  reference reports it through `warn` when warnings are on ("error in __gc
+  (...)"); with warnings off, both discard it.
 - `collectgarbage("param")` stores the values and returns them but does not
   change the collector. `collectgarbage("count")` is the host's memory figure.
 - Lua call depth is capped at 50000 frames (`MAXDEPTH` in `compiler.lua`); the
