@@ -27,18 +27,31 @@ return function(G)
     return table.concat(lines, "\n")
   end
 
+  -- splits a call description such as "global 'f'" into namewhat and name
+  local function splitdesc(desc)
+    if desc == nil then return nil, nil end
+    local kind, name = desc:match("^(%S+) '(.*)'$")
+    if kind == "for" then kind = "for iterator" end
+    return name, kind
+  end
+
   local function getinfo(a, opts)
     local t = R.newtable()
     local st = R.stack
     if type(a) == "number" then
       if a < 0 or a > st.n then return nil end
-      local f = st[st.n - a + 1]
       if a == 0 then return nil end
+      local f = st[st.n - a + 1]
       if f then
         t.hash.currentline = f.line
         t.hash.short_src = f.src
         t.hash.source = "@" .. f.src
         t.hash.what = "Lua"
+        -- the name is recorded by the caller, one frame up
+        local caller = st[st.n - a]
+        local name, namewhat = splitdesc(caller and caller.cdesc)
+        t.hash.name = name
+        t.hash.namewhat = namewhat or ""
       end
     elseif type(a) == "function" then
       t.hash.func = a

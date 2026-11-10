@@ -673,8 +673,17 @@ local function statement()
       ls:advance()
       local name = checkname()
       -- a name already declared const cannot be defined by a function statement
-      local attrib = globalattrib(name, line, true)
-      if attrib then errorat("attempt to assign to const variable '" .. name .. "'", line) end
+      -- only an explicit const declaration of this name is an error;
+      -- a '*' declaration is shadowed by the new one
+      for i = #gdecls, 1, -1 do
+        local e = gdecls[i]
+        if e.names[name] ~= nil then
+          if e.names[name] then
+            errorat("attempt to assign to const variable '" .. name .. "'", line)
+          end
+          break
+        end
+      end
       gdecls[#gdecls + 1] = { all = false, names = { [name] = false } }
       local f = funcbody(false, line, name)
       return { k = "assign", targets = { singlevar(name, line) }, exprs = { { k = "func", f = f, line = line } }, line = line }
@@ -780,7 +789,7 @@ funcbody = function(ismethod, line, name)
         isvararg = true
         -- Lua 5.5 named vararg: '...name' binds a table with the extra arguments
         if ls.t == "name" then
-          varvar = newvarinfo(ls.v, nil)
+          varvar = newvarinfo(ls.v, "const")   -- the vararg name is read-only
           ls:advance()
           activate(varvar)
         end

@@ -269,8 +269,10 @@ function Lexer:readstring(pos, q, line)
       elseif e == 120 then -- \xXX
         local h = ssub(src, s + 2, s + 3)
         if not sfind(h, "^%x%x$") then
-          self.pos = s + 2
-          self:error("hexadecimal digit expected", ssub(src, pos, s + 3))
+          -- the message shows the text up to the first offending character
+          local bad = sfind(ssub(src, s + 2, s + 2), "%x") and s + 3 or s + 2
+          self.pos = bad + 1
+          self:error("hexadecimal digit expected", ssub(src, pos, bad))
         end
         buf[#buf + 1] = schar(tonumber(h, 16))
         p = s + 4
@@ -313,8 +315,9 @@ function Lexer:readstring(pos, q, line)
         local ds, de = sfind(src, "^%d%d?%d?", s + 1)
         local v = tonumber(ssub(src, ds, de))
         if v > 255 then
+          -- the message includes the character after the digits
           self.pos = de + 1
-          self:error("decimal escape too large", ssub(src, pos, de))
+          self:error("decimal escape too large", ssub(src, pos, de + 1))
         end
         buf[#buf + 1] = schar(v)
         p = de + 1
@@ -368,12 +371,8 @@ function Lexer:lookahead()
 end
 
 function M.new(src, chunkname)
+  -- (a leading '#' line is skipped by the file loaders, not here)
   local self = setmetatable({ src = src, pos = 1, line = 1, chunk = chunkname }, Lexer)
-  -- skip a first line starting with '#' (shebang)
-  if ssub(src, 1, 1) == "#" then
-    local e = sfind(src, "[\n\r]")
-    self.pos = e or (#src + 1)
-  end
   self:advance()
   return self
 end

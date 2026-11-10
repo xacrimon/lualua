@@ -200,6 +200,36 @@ return function(G)
     type = mtype,
     ult = ult,
   })
+  -- frexp/ldexp are part of the standard build; the rest are LUA_COMPAT_MATHLIB
+  R.setfuncs(lib, {
+    frexp = function(x)
+      x = R.checknumber(x, 1, "frexp")
+      if x == 0 or x ~= x or x == math.huge or x == -math.huge then return x, 0 end
+      local e, ax = 0, math.abs(x)
+      while ax >= 1 do ax = ax / 2; e = e + 1 end
+      while ax < 0.5 do ax = ax * 2; e = e - 1 end
+      return (x < 0 and -ax or ax), e
+    end,
+    ldexp = function(m, e)
+      m = R.checknumber(m, 1, "ldexp")
+      e = R.checkinteger(e, 2, "ldexp")
+      while e > 1000 do m = m * 2.0 ^ 1000; e = e - 1000 end
+      while e < -1000 do m = m * 2.0 ^ -1000; e = e + 1000 end
+      return m * 2.0 ^ e
+    end,
+    atan2 = atan,
+    cosh = unary("cosh", function(x) return (math.exp(x) + math.exp(-x)) / 2 end),
+    sinh = unary("sinh", function(x) return (math.exp(x) - math.exp(-x)) / 2 end),
+    tanh = unary("tanh", function(x)
+      if x > 20 then return 1.0 elseif x < -20 then return -1.0 end
+      local a, b = math.exp(x), math.exp(-x)
+      return (a - b) / (a + b)
+    end),
+    pow = function(x, y)
+      return R.checknumber(x, 1, "pow") ^ R.checknumber(y, 2, "pow")
+    end,
+    log10 = unary("log10", function(x) return math.log(x, 10) end),
+  })
   lib.hash.huge = math.huge
   lib.hash.pi = math.pi
   lib.hash.maxinteger = math.maxinteger

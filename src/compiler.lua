@@ -38,6 +38,13 @@ C.FUPS = FUPS
 local CURSRC = "?"   -- chunk name of the chunk being compiled
 
 -- Description of an expression for error messages ("local 'x'", ...).
+-- Number of values in a named vararg table (its field n must be a proper count).
+local function vacount(t)
+  local n = t.hash.n
+  if mtype(n) ~= "integer" or n < 0 or n >= 0x7fffffff then rterror("no proper 'n'") end
+  return n
+end
+
 local function describe(node)
   local k = node.k
   if k == "local" then return "local '" .. node.name .. "'" end
@@ -320,7 +327,7 @@ cmulti = function(node)
       local s, cap = node.var.slot, node.var.captured
       return function(A)
         local t = cap and A[s].v or A[s]
-        return unpack(t.hash, 1, t.hash.n)
+        return unpack(t.hash, 1, vacount(t))
       end
     end
     return function(A)
@@ -334,9 +341,12 @@ cmulti = function(node)
     local line = node.line
     return function(A)
       local fv = f(A)
+      local a = pack(argsf(A))
+      -- the caller records the callee's description (for debug.getinfo names)
       A.line = line
-      if type(fv) == "function" then return fv(argsf(A)) end
-      return callx(d, fv, argsf(A))
+      A.cdesc = d
+      if type(fv) == "function" then return fv(unpack(a, 1, a.n)) end
+      return callx(d, fv, unpack(a, 1, a.n))
     end
   elseif k == "method" then
     local o = cexpr(node.obj)
@@ -348,9 +358,11 @@ cmulti = function(node)
     return function(A)
       local ob = o(A)
       local fv = index(ob, name, d)
+      local a = pack(argsf(A))
       A.line = line
-      if type(fv) == "function" then return fv(ob, argsf(A)) end
-      return callx(mdesc, fv, ob, argsf(A))
+      A.cdesc = mdesc
+      if type(fv) == "function" then return fv(ob, unpack(a, 1, a.n)) end
+      return callx(mdesc, fv, ob, unpack(a, 1, a.n))
     end
   end
   return cexpr(node)

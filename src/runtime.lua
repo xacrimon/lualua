@@ -331,7 +331,9 @@ local function bitmeta(ev, a, b, da, db)
   local h = metamethod(a, ev) or metamethod(b, ev)
   if h ~= nil then return (call(h, a, b)) end
   if tonum(a) ~= nil and tonum(b) ~= nil then
-    rterror("number has no integer representation")
+    -- blame the operand that has no integer representation
+    local d = (tointeger_v(a) == nil) and da or db
+    rterror("number" .. varinfo(d) .. " has no integer representation")
   end
   local culprit, d = b, db
   if tonum(a) == nil then culprit, d = a, da end
@@ -383,7 +385,7 @@ function R.idiv(a, b, da, db)
   local x, y = tonum(a), tonum(b)
   if x and y then
     if mtype(x) == "integer" and mtype(y) == "integer" then
-      if y == 0 then rterror("attempt to perform 'n//0'") end
+      if y == 0 then rterror("attempt to divide by zero") end
     end
     return x // y
   end
@@ -498,7 +500,7 @@ end
 local function len(v, desc)
   if type(v) == "string" then return #v end
   local h = metamethod(v, "__len")
-  if h ~= nil then return (call(h, v)) end
+  if h ~= nil then return (call(h, v, v)) end   -- like Lua, the operand is passed twice
   if isTable(v) then return rawlen(v) end
   rterror("attempt to get length of a " .. ltype(v) .. " value" .. varinfo(desc))
 end
