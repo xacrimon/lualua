@@ -118,6 +118,10 @@ return function(G)
     i1[n1] = i2[n2]
   end
 
+  local function unsupported(name)
+    R.rterror("debug." .. name .. " is not supported by lualua")
+  end
+
   R.setfuncs(lib, {
     traceback = traceback,
     getinfo = getinfo,
@@ -134,9 +138,20 @@ return function(G)
       end
       return v
     end,
-    sethook = function() end,
-    gethook = function() return nil end,
-    getlocal = function() return nil end,
+    -- Hooks, local variable access, the registry and uservalues are not implemented.
+    -- Requests that cannot be served raise an error instead of being silently ignored.
+    sethook = function(...)
+      local hook = ...
+      if type(hook) == "thread" then hook = (select(2, ...)) end
+      if hook == nil then return end   -- clearing hooks: no hook can be set, so nothing to clear
+      unsupported("sethook")
+    end,
+    gethook = function() return nil end,   -- no hook can be set
+    getlocal = function() unsupported("getlocal") end,
+    setlocal = function() unsupported("setlocal") end,
+    getregistry = function() unsupported("getregistry") end,
+    getuservalue = function() unsupported("getuservalue") end,
+    setuservalue = function() unsupported("setuservalue") end,
   })
   G.hash.debug = lib
 end

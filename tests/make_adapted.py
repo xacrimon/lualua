@@ -112,6 +112,17 @@ def comment_all(f, fragment, cat, note):
 
 
 
+def replace_once(f, old, new, cat, note):
+    """Replaces the single occurrence of old by new, tagged with a STUB comment."""
+    path = os.path.join(DST, f)
+    text = open(path, encoding="latin-1").read()
+    if text.count(old) != 1:
+        sys.exit(f"{f}: replace target matched {text.count(old)} times")
+    text = text.replace(old, new + f"  -- STUB[{cat}] {note}")
+    open(path, "w", encoding="latin-1").write(text)
+    log.append(f"{f}: [{cat}] {note}")
+
+
 def stub_db():
     """db.lua tests the debug library almost throughout, so its debug assertions are
     stubbed section by section; sections that test only ordinary Lua keep running.
@@ -119,6 +130,11 @@ def stub_db():
     F = "db.lua"
     # line hooks (debug.sethook) are not delivered: the trace helper cannot check events
     stub(F, "  assert(#l == 0)", "debug", "line hook trace helper: no hook events delivered")
+    replace_once(F, 'debug.sethook(f,"l"); load(s)(); debug.sethook()', "load(s)()", "debug",
+                 "line hook not set (sethook unsupported); the chunk still runs")
+    comment_all(F, 'debug.sethook(function () end, "l")', "debug", "line hook on a coroutine (sethook unsupported)")
+    comment_all(F, 'debug.sethook(function () count = count + 1 end, "", 1)', "debug",
+                "count hook not set (sethook unsupported); the checks on values still run")
     # getinfo activelines (the 'L' option) is not implemented
     stmt(F, "assert(b.activelines[b.linedefined + 1] and", "debug", "getinfo activelines (L option)")
     stmt(F, "assert(not b.activelines[b.linedefined] and", "debug", "getinfo activelines (L option)")

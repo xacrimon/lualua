@@ -66,7 +66,7 @@ return function(G)
   -- one shared iterator, so that ipairs(a) == ipairs(b) for the iterator
   local function ipairs_iter(tt, i)
     i = i + 1
-    local v = R.index(tt, i)
+    local v = R.noyield(R.index, tt, i)
     if v == nil then return nil end
     return i, v
   end
@@ -238,7 +238,7 @@ return function(G)
     elseif type(chunk) == "function" then
       local parts = {}
       while true do
-        local piece = R.call(chunk)
+        local piece = R.noyield(R.call, chunk)
         if piece == nil or piece == "" then break end
         if type(piece) ~= "string" then
           return nil, "reader function must return a string"
@@ -338,6 +338,10 @@ return function(G)
     end
     if warnon then io.stderr:write("Lua warning: ", msg, "\n") end
   end
+  -- messages produced by the runtime itself (such as errors in __gc)
+  R.emitwarning = function(msg)
+    if warnon then io.stderr:write("Lua warning: ", msg, "\n") end
+  end
 
   -- package and require ----------------------------------------------------
 
@@ -399,7 +403,7 @@ return function(G)
       if not f then R.rterror("error loading module '" .. name .. "' from file '" .. file .. "':\n\t" .. tostring(err)) end
       loader_fn, extra = f, file
     end
-    local res = R.call(loader_fn, name, extra)
+    local res = R.noyield(R.call, loader_fn, name, extra)
     if res ~= nil then loaded.hash[name] = res end
     if loaded.hash[name] == nil then loaded.hash[name] = true end
     return loaded.hash[name], extra

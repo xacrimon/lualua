@@ -211,12 +211,32 @@ local function weakmt(mode)
 end
 
 -- Runs the Lua finalizer of an object collected by the host.
+-- Runs op(...) for a library function that calls Lua values (metamethods, reader
+-- functions, ...): the coroutine's non-yieldable depth is raised for the duration.
+-- Results are passed through; the depth is restored on normal return (an error
+-- is handled by the enclosing pcall, which restores it).
+local function noyield_end(st, saved, ...)
+  st.nny = saved
+  return ...
+end
+function R.noyield(op, ...)
+  local st = R.stack
+  local saved = st.nny or 0
+  st.nny = saved + 1
+  return noyield_end(st, saved, op(...))
+end
+
+-- Runs the __gc metamethod of an object collected by the host (as lgc.c GCTM):
+-- not yieldable, and an error becomes a warning "error in __gc (msg)".
 local function finalize(o)
   local mt = o.mt
   local h = mt and mt.hash.__gc
   if h ~= nil then
-    -- errors in finalizers are ignored (Lua reports them only as warnings)
-    pcall(R.call, h, o)
+    local ok, e = pcall(R.noyield, R.call, h, o)
+    if not ok then
+      local msg = type(e) == "string" and e or "error object is not a string"
+      if R.emitwarning then R.emitwarning("error in __gc (" .. msg .. ")") end
+    end
   end
 end
 R.finalize = finalize
@@ -641,7 +661,7 @@ local function tostr(v)
   if t == "nil" or t == "boolean" then return tostring(v) end
   local h = metamethod(v, "__tostring")
   if h ~= nil then
-    local s = (call(h, v))
+    local s = (R.noyield(call, h, v))
     if type(s) == "number" then return tostring(s) end
     if type(s) ~= "string" then rterror("'__tostring' must return a string") end
     return s

@@ -4,7 +4,9 @@ local pack, unpack = table.pack, table.unpack
 -- __index, __newindex and __len are honoured.
 local R = require("runtime")
 
-local geti, seti = R.index, R.setindex
+-- element access may call metamethods, which are not yieldable from a library function
+local function geti(t, k) return R.noyield(R.index, t, k) end
+local function seti(t, k, v) return R.noyield(R.setindex, t, k, v) end
 local ult = math.ult
 local maxint = math.maxinteger
 local INT_MAX = 2147483647
@@ -30,7 +32,7 @@ end
 -- luaL_len: length through __len, which must be an integer.
 local function getn(t, n, fname, what)
   checktab(t, n, fname, what | TL)
-  local l = R.tointeger(R.len(t))
+  local l = R.tointeger(R.noyield(R.len, t))
   if l == nil then R.rterror("object length is not an integer") end
   return l
 end

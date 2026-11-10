@@ -51,7 +51,7 @@ end
 
 -- Integer field `key` of date table `tab` (getfield in loslib.c). d < 0 means required.
 local function getfield(tab, key, d, delta)
-  local v = R.index(tab, key)
+  local v = R.noyield(R.index, tab, key)
   local res = R.tointegerv(v)
   if res == nil then
     if v ~= nil then R.rterror("field '" .. key .. "' is not an integer") end
@@ -75,12 +75,12 @@ local function os_time(tab)
     min = getfield(tab, "min", 0, 0),
     sec = getfield(tab, "sec", 0, 0),
   }
-  local isdst = R.index(tab, "isdst")
+  local isdst = R.noyield(R.index, tab, "isdst")
   if isdst ~= nil then ht.isdst = R.truthy(isdst) end
   local t = H.time(ht)
   -- update the fields with the normalised values, as mktime does
   local norm = H.date("*t", t)
-  for _, k in ipairs(DATE_FIELDS) do R.setindex(tab, k, norm[k]) end
+  for _, k in ipairs(DATE_FIELDS) do R.noyield(R.setindex, tab, k, norm[k]) end
   return t
 end
 

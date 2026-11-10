@@ -54,7 +54,8 @@ return function(G)
 
   local function yield(...)
     if (R.stack.nny or 0) > 0 then
-      R.rterror("attempt to yield across a C-call boundary")
+      -- raised inside the native yield, so (as in the reference) no position is added
+      R.throw("attempt to yield across a C-call boundary")
     end
     local r = pack(coyield(...))
     -- resumed by coroutine.close: unwind the coroutine (running its __close handlers)

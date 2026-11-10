@@ -143,10 +143,11 @@ Debug library, as implemented (`src/lib/debug.lua`) and as stubbed:
   supported. Missing: `activelines` (`L`), `nparams`, `nups`, `isvararg`,
   `istailcall`, `ftransfer`/`ntransfer`, `nparams` for C functions, and
   name/namewhat `metamethod` and `for iterator` for frames not on the stack.
-- `sethook`, `gethook`: accepted but inert (no events are delivered; `gethook`
-  returns nothing). Line, call, return and count hooks are not implemented.
-- `getlocal`: always returns nothing. `setlocal`, `getuservalue`,
-  `setuservalue`, `debug.getregistry` are not provided.
+- `sethook`: clearing hooks (`sethook()`, a nil hook) is a no-op, since no hook
+  can be set; setting one raises "debug.sethook is not supported by lualua".
+  `gethook` returns nothing. Line, call, return and count hooks are not implemented.
+- `getlocal`, `setlocal`, `getuservalue`, `setuservalue` and `debug.getregistry`
+  raise "... is not supported by lualua" rather than being silently ignored.
 - `traceback`: one line per Lua frame without level or thread arguments; not
   the reference layout.
 - Upvalue functions work only for closures created by `compiler.lua`.
@@ -158,14 +159,17 @@ Known gaps that remain (not excluded):
   constant index (more than 255 constants gives `field`).
 - Deep recursion to the frame limit is slow (about a minute for
   `cstack.lua`): frames are heavier than the reference's.
-- `coroutine.isyieldable` and yields across library callbacks model only
-  `gsub` and `table.sort`; other natives that call Lua (`tostring` with
-  `__tostring`, `load`'s reader, ...) let a yield through where the reference
-  raises "attempt to yield across a C-call boundary".
+- Yields across library callbacks are refused (as in the reference, "attempt to
+  yield across a C-call boundary") for the callbacks of `gsub`, `table.sort`,
+  `tostring`/`print`/`string.format` (`__tostring`), `load`'s reader, `require`,
+  the `ipairs` iterator, the table functions' metamethods, and `os.time`'s field
+  access. `R.noyield` raises the non-yieldable depth around such calls.
+  `pairs` (`__pairs`), `pcall`, `xpcall` and `dofile` stay yieldable, as in the
+  reference. Other library paths that call Lua were not reviewed.
 - Finalizers run from the host collector, so their timing and order are the
-  host's, not the reference's. An error inside `__gc` is discarded. The
-  reference reports it through `warn` when warnings are on ("error in __gc
-  (...)"); with warnings off, both discard it.
+  host's, not the reference's. `__gc` runs non-yieldable; an error inside it
+  goes to `warn` as "error in __gc (msg)", shown only when warnings are on,
+  as in the reference.
 - `collectgarbage("param")` stores the values and returns them but does not
   change the collector. `collectgarbage("count")` is the host's memory figure.
 - Lua call depth is capped at 50000 frames (`MAXDEPTH` in `compiler.lua`); the
