@@ -187,24 +187,28 @@ end
 -- Calls
 ---------------------------------------------------------------------------
 
--- Call any Lua value with the given arguments; returns all results.
-local function call(f, ...)
+-- Calls f(...) honouring __call chains (at most 15 objects, as in Lua 5.5).
+-- desc names the called expression for error messages; n counts the chain.
+local function callchain(desc, f, n, ...)
   if type(f) == "function" then return f(...) end
   local h = metamethod(f, "__call")
-  if h == nil then rterror("attempt to call a " .. ltype(f) .. " value") end
-  return call(h, f, ...)
+  if h == nil then
+    rterror("attempt to call a " .. ltype(f) .. " value" .. (desc and (" (" .. desc .. ")") or ""))
+  end
+  if n >= 15 then rterror("'__call' chain too long; possibly a loop") end
+  return callchain(nil, h, n + 1, f, ...)
+end
+
+-- Call any Lua value with the given arguments; returns all results.
+local function call(f, ...)
+  return callchain(nil, f, 0, ...)
 end
 R.call = call
 
 -- Like call, but the error message names the called expression `desc`
 -- (for example "global 'print'"). Used by compiled code.
 local function callx(desc, f, ...)
-  if type(f) == "function" then return f(...) end
-  local h = metamethod(f, "__call")
-  if h == nil then
-    rterror("attempt to call a " .. ltype(f) .. " value" .. (desc and (" (" .. desc .. ")") or ""))
-  end
-  return call(h, f, ...)
+  return callchain(desc, f, 0, ...)
 end
 R.callx = callx
 

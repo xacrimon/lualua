@@ -35,7 +35,8 @@ local MAXDEPTH = 195000
 -- closure -> its upvalue cells; the cell array also carries .names (upvalue names)
 local FUPS = setmetatable({}, { __mode = "k" })
 C.FUPS = FUPS
-local CURSRC = "?"   -- chunk name of the chunk being compiled
+local CURSRC = "?"      -- short chunk name of the chunk being compiled
+local CURSOURCE = "?"   -- the chunk name as given to load
 
 -- Description of an expression for error messages ("local 'x'", ...).
 -- Number of values in a named vararg table (its field n must be a proper count).
@@ -908,6 +909,8 @@ compile_proto = function(proto)
   local c = {
     upnames = upnames,
     src = CURSRC,
+    source = CURSOURCE,
+    lastline = proto.lastline,
     line = proto.line,
     params = params,
     np = #params,
@@ -927,10 +930,13 @@ end
 function C.newlua(c, ups)
   local run, params, np, isvararg = c.run, c.params, c.np, c.isvararg
   local src, line = c.src, c.line
+  local source = c.source
   local varslot, varcap = c.varslot, c.varcap
   ups.names = c.upnames
+  ups.source, ups.short, ups.line = source, src, line
+  ups.lastline = c.lastline
   local fn = function(...)
-    local A = { up = ups, src = src, line = line }
+    local A = { up = ups, src = src, line = line, source = source }
     if np > 0 then
       local args = { ... }
       for i = 1, np do
@@ -977,8 +983,9 @@ end
 
 -- Compiles a parsed chunk (proto) and returns a Lua function whose
 -- _ENV upvalue is set to env.
-function C.load(proto, src, env)
+function C.load(proto, src, env, source)
   CURSRC = src
+  CURSOURCE = source or src
   local c = compile_proto(proto)
   return C.newlua(c, { { v = env } })
 end

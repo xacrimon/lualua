@@ -49,8 +49,9 @@ return function(G)
       if f then
         t.hash.currentline = f.line
         t.hash.short_src = f.src
-        t.hash.source = "@" .. f.src
+        t.hash.source = f.source
         t.hash.what = "Lua"
+        t.hash.extraargs = f.va and f.va.n or 0
         -- the name is recorded by the caller, one frame up
         local caller = st[st.n - a]
         local name, namewhat = splitdesc(caller and caller.cdesc)
@@ -59,9 +60,19 @@ return function(G)
       end
     elseif type(a) == "function" then
       t.hash.func = a
-      t.hash.what = "Lua"
-      t.hash.short_src = "?"
-      t.hash.source = "=?"
+      local info = C.FUPS[a]
+      if info then
+        t.hash.what = "Lua"
+        t.hash.short_src = info.short
+        t.hash.source = info.source
+        t.hash.linedefined = info.line
+        t.hash.lastlinedefined = info.lastline
+      else
+        t.hash.what = "C"
+        t.hash.short_src = "[C]"
+        t.hash.source = "=[C]"
+        t.hash.linedefined = -1
+      end
       t.hash.currentline = -1
     else
       R.argerror(1, "getinfo", "function or level expected")

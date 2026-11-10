@@ -180,8 +180,10 @@ return function(G)
     if r[1] then return unpack(r, 1, r.n) end
     st.n = n
     local hr = pack(pcall(R.call, handler, r[2]))
+    st.n = n
     if not hr[1] then
-      return false, hr[2]
+      -- an error inside the message handler
+      return false, "error in error handling"
     end
     return false, hr[2]
   end
@@ -207,7 +209,11 @@ return function(G)
       R.typeerror(1, "load", "string", chunk)
     end
     if mode ~= nil then
-      R.checkstring(mode, 3, "load")
+      mode = R.checkstring(mode, 3, "load")
+      -- only text chunks are supported (no precompiled binary chunks)
+      if not mode:find("t", 1, true) then
+        return nil, "attempt to load a text chunk (mode is '" .. mode .. "')"
+      end
     end
     local e = G
     if select("#", ...) >= 1 then e = (...) end   -- explicit env argument (even nil)

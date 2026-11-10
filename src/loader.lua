@@ -29,7 +29,7 @@ function L.load(src, chunkname, env)
   local short = L.chunkid(chunkname)
   local ok, proto = pcall(parser.parse, src, short)
   if not ok then return nil, proto end
-  return C.load(proto, short, env)
+  return C.load(proto, short, env, chunkname)
 end
 
 return L

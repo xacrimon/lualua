@@ -124,7 +124,7 @@ local function closeblock(b)
   else
     if #b.gotos > 0 then
       local g = b.gotos[1]
-      errorat("no visible label '" .. g.name .. "' for goto", g.line)
+      errorat("no visible label '" .. g.name .. "' for <goto> at line " .. g.line, g.line)
     end
   end
   for i = #fs.actvars, b.nactive + 1, -1 do fs.actvars[i] = nil end
@@ -698,11 +698,11 @@ local function statement()
     local bb = b
     while bb do
       if bb.labels[name] then
-        errorat("label '" .. name .. "' already defined", line)
+        errorat("label '" .. name .. "' already defined on line " .. bb.labels[name], line)
       end
       bb = bb.parent
     end
-    b.labels[name] = true
+    b.labels[name] = line
     while ls.t == ";" do ls:advance() end   -- void statements do not count
     return { k = "label", name = name, line = line, nact = #fs.actvars }
   elseif t == "return" then
